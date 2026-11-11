@@ -43,6 +43,45 @@ The full rules are in [`docs/SPEC.md`](docs/SPEC.md). If the spec and `engine.js
 
 Every change pushed to `main` is published automatically. Other branches get their own preview link.
 
+## Use your own domain (bought from internet.am)
+
+The code needs no change for this: it works on any address. Two places to set up, Vercel and internet.am.
+Below, `example.am` stands for your domain.
+
+1. **Tell Vercel about the domain.** In the project: *Settings → Domains → Add*, type `example.am`, and accept
+   the suggestion to also add `www.example.am` (one of them redirects to the other).
+   Vercel then lists the DNS records it wants. **Copy the values from that screen**; they are the right ones for
+   your project. They usually look like this:
+
+   | Type | Name (host) | Value |
+   |---|---|---|
+   | `A` | `@` (empty, the domain itself) | `76.76.21.21` (or the IP Vercel shows) |
+   | `CNAME` | `www` | `cname.vercel-dns.com` (or the `…vercel-dns…com` value Vercel shows) |
+
+2. **Add the records at internet.am.** Sign in to your account on internet.am, open the domain, and find its
+   DNS management (DNS records / zone editor). Add the two records above exactly as Vercel shows them,
+   and delete any old `A` record for `@` or `CNAME` for `www` that points somewhere else (a parking page).
+   - If the domain's DNS is not hosted at internet.am (no records page), use the other way instead:
+     change the domain's **name servers** to `ns1.vercel-dns.com` and `ns2.vercel-dns.com`, and Vercel
+     creates the records itself.
+
+3. **Wait.** Usually minutes, sometimes a few hours. The Domains page turns to *Valid Configuration*, and
+   Vercel issues the HTTPS certificate on its own. Then open `https://example.am`; it asks for the same
+   password as before.
+
+If it still says *Invalid Configuration* after a few hours, check the records from any computer:
+
+```bash
+nslookup example.am
+```
+
+```bash
+nslookup www.example.am
+```
+
+The first must answer with Vercel's IP, the second with the Vercel `CNAME`. Anything else means an old record
+is still there, or the name servers are not the ones you edited.
+
 ## Connecting Jira
 
 The calculator reads Jira in one of two ways. It never changes anything in Jira.
