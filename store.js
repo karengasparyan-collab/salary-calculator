@@ -109,9 +109,20 @@ function RedisStore(url, token, prefix, fetchImpl) {
 }
 
 /** Pick the store from the environment: Upstash/Vercel KV variables → Redis; on a normal computer → a file; on Vercel without Redis → none. */
+function redisFromEnv(env) {
+  let url = env.KV_REST_API_URL || env.UPSTASH_REDIS_REST_URL;
+  let token = env.KV_REST_API_TOKEN || env.UPSTASH_REDIS_REST_TOKEN;
+  if (!url || !token) {
+    // Vercel lets you pick a prefix when connecting Upstash (e.g. STORAGE_REST_API_URL): accept any.
+    for (const k of Object.keys(env).sort()) {
+      const m = k.match(/^(.+)_REST_API_URL$/);
+      if (m && env[k] && env[m[1] + "_REST_API_TOKEN"]) { url = env[k]; token = env[m[1] + "_REST_API_TOKEN"]; break; }
+    }
+  }
+  return { url, token };
+}
 function storeFromEnv(env, root) {
-  const url = env.KV_REST_API_URL || env.UPSTASH_REDIS_REST_URL;
-  const token = env.KV_REST_API_TOKEN || env.UPSTASH_REDIS_REST_TOKEN;
+  const { url, token } = redisFromEnv(env);
   if (url && token) return RedisStore(url, token, env.DB_PREFIX);
   if (env.VERCEL) return null; // Vercel's disk is read-only and not shared: connect Upstash Redis instead
   return FileStore(env.DATA_FILE || path.join(root, "data", "db.json"));

@@ -205,6 +205,10 @@ const basic = (u, p) => "Basic " + Buffer.from(`${u}:${p}`).toString("base64");
     await assert.rejects(bad.all(), (e) => e.code === "unavailable");
   });
   upstash.close();
+  await t("database found under any Vercel prefix", () => {
+    assert.strictEqual(DB.storeFromEnv({ VERCEL: "1", STORAGE_REST_API_URL: "https://x", STORAGE_REST_API_TOKEN: "t", STORAGE_REST_API_READ_ONLY_TOKEN: "r" }, "/x").kind, "redis");
+    assert.strictEqual(DB.storeFromEnv({ VERCEL: "1", STORAGE_REST_API_URL: "https://x" }, "/x"), null);
+  });
   await t("Vercel without a database → none (not the read-only disk)", () => assert.strictEqual(DB.storeFromEnv({ VERCEL: "1" }, "/x"), null));
   await t("no database → clear 503", async () => {
     const r = await fetch(base + "/api/db", { headers: AUTH });
