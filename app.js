@@ -187,7 +187,7 @@ async function write(fn, okMsg) {
     let msg = "Could not save. Try again.";
     if (e && e.code === "invalid_argument") { msg = "This change was refused (no edit access, or the data is too large)."; }
     if (e && e.code === "quota_exceeded") msg = "Storage is full. Delete old months to free space.";
-    if (e && e.code === "login_required") msg = "Your sign-in expired. Reload the page and enter the password.";
+    if (e && e.code === "login_required") msg = "Your sign-in expired. Reload the page and sign in again.";
     if (e && e.code === "unavailable") { try { await new Promise((r) => setTimeout(r, 400 + Math.random() * 600)); await fn(); setSave("Saved"); return true; } catch (e2) {} }
     setSave("Not saved"); toast(msg); return false;
   } finally { saving--; }
@@ -707,7 +707,9 @@ document.addEventListener("change", async (ev) => {
   else if (el.dataset.action === "skip-hours") { const v = el.checked; el.blur(); await write(async () => { await ensureMonthDoc(); await S.db.doc("months/" + S.month).update({ skipHours: v }); }, v ? "Working hours not counted for " + monthName(S.month) : "Working hours counted again"); render(); }
 });
 document.addEventListener("submit", async (ev) => {
-  const form = ev.target; ev.preventDefault();
+  const form = ev.target;
+  if (form.id === "logoutForm") return; // a normal form post to /logout: the server clears the cookie
+  ev.preventDefault();
   const fd = Object.fromEntries(new FormData(form).entries());
   if (form.dataset.form === "incident") {
     const doc = { memberId: fd.memberId, date: fd.date, level: fd.level, note: fd.note.trim(), aiSlop: !!fd.aiSlop, createdAt: new Date().toISOString() };
@@ -824,7 +826,7 @@ function pullError(e) {
     tool_error: "Jira refused the search: " + ((e && e.message) || "unknown error"),
     jira_auth: "Jira refused the server's e-mail / API token. Check JIRA_EMAIL and JIRA_API_TOKEN on the server, then restart it.",
     not_configured: "The server has no Jira token yet. Set JIRA_EMAIL and JIRA_API_TOKEN, then restart it.",
-    login_required: "Your sign-in to this site expired. Reload the page and enter the password.",
+    login_required: "Your sign-in to this site expired. Reload the page and sign in again.",
     bad_request: "The server refused the request: " + ((e && e.message) || "unknown error"),
   }[code];
   return msg || `Couldn't pull from Jira (${code}). You can upload a CSV export instead.`;
@@ -1012,10 +1014,11 @@ async function boot() {
     // Standalone website: keep the data in this browser. If storage is blocked, run in memory and say so.
     S.downloads = null; S.mcp = null; S.canEdit = true; S.loadError = "";
     S.jiraServer = await findServer();
+    const out = $("#logoutForm"); if (out) out.classList.toggle("hide", !(S.jiraServer && S.jiraServer.auth)); // "Log out" only where there is a sign-in
     if (S.jiraServer && S.jiraServer.db) {
       // Shared data on the Glana server: everyone with the password sees the same numbers.
       try { const remote = ServerDB(); const all = await remote.loadAll(); S.db = MemDB(null, remote); S.db.refresh(all); S.mode = "server"; }
-      catch (e) { S.db = MemDB(); S.mode = "local"; S.loadError = e && e.code === "login_required" ? "Your sign-in expired. Reload the page and enter the password." : "Couldn't load the shared data from the server. Check the connection and reload the page."; }
+      catch (e) { S.db = MemDB(); S.mode = "local"; S.loadError = e && e.code === "login_required" ? "Your sign-in expired. Reload the page and sign in again." : "Couldn't load the shared data from the server. Check the connection and reload the page."; }
     } else {
       try { S.db = MemDB(STORE_KEY); S.mode = "browser"; } catch (e) { S.db = MemDB(); S.mode = "local"; }
     }

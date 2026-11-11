@@ -17,11 +17,12 @@ The full rules are in [`docs/SPEC.md`](docs/SPEC.md). If the spec and `engine.js
 | `index.html` | The page: layout and styles (sidebar navigation, top bar with the pay month, payslip side panel; icon rail on tablets, bottom bar on phones). |
 | `engine.js` | All the pay math. Pure functions, no DOM. Runs in the browser, the server and the tests. |
 | `app.js` | The app: tabs, payslip, Jira pull and CSV import, hours import, incidents, team, settings, storage. |
-| `server.js` | Small Node server: serves the site behind a password, reads Jira with an API token, stores the shared data. No packages needed. |
+| `login.html` | The sign-in page (same colors and fonts as the app). |
+| `server.js` | Small Node server: serves the site behind a sign-in page, reads Jira with an API token, stores the shared data. No packages needed. |
 | `store.js` | Shared data storage: a file on this computer, or Upstash Redis on Vercel. |
 | `api/index.js`, `vercel.json` | Runs the same server on Vercel. |
 | `test_engine.js` | 54 unit tests of the engine with hand-checked values. |
-| `tests/server.test.js` | Server tests: Jira paging, query checks, password, which files are served, shared data (file, Redis). |
+| `tests/server.test.js` | Server tests: Jira paging, query checks, sign-in and cookie, which files are served, shared data (file, Redis). |
 | `tests/e2e.js` | Browser test of the full month flow, including Pull from Jira (820,800 AMD worked example). |
 
 ## Put it online with Vercel (one time, about 10 minutes)
@@ -39,7 +40,7 @@ The full rules are in [`docs/SPEC.md`](docs/SPEC.md). If the spec and `engine.js
    | `JIRA_API_TOKEN` | the token from https://id.atlassian.com/manage-profile/security/api-tokens |
 
 4. **Redeploy.** *Deployments → … → Redeploy*, so the new settings are picked up.
-5. **Open the site.** Sign in with user `glana` and your `APP_PASSWORD`. Settings → Backup lets you load data you already have.
+5. **Open the site.** Type your `APP_PASSWORD` on the sign-in page (you stay signed in for 7 days). Settings → Backup lets you load data you already have.
 
 Every change pushed to `main` is published automatically. Other branches get their own preview link.
 
@@ -124,9 +125,24 @@ The Jira CSV export (*Export → Export CSV (all fields)*) still works as a fall
 ## Security
 
 - Salaries are confidential. Without `APP_PASSWORD` the server only listens on this computer (127.0.0.1) and refuses
-  to start on a public address. With it, every page asks for the password; 10 wrong tries lock that address out for 15 minutes.
-- Put the site behind HTTPS when it is online (Render, Railway, Fly.io and similar do this for you).
-- The server only serves `index.html`, `app.js` and `engine.js`, never `.env` or the server code.
+  to start on a public address. On Vercel the site stays locked (a plain "set APP_PASSWORD" message) until it is set.
+- **Sign-in page.** With `APP_PASSWORD` set, the site shows its own sign-in page at `/login` (no browser popup). Until
+  you sign in, every page sends you to `/login` and every `/api/…` request answers `401` with JSON; `index.html`,
+  `app.js` and `engine.js` are not sent. Only the password is asked (`APP_USER` is no longer needed).
+- **Staying signed in.** A correct password sets a cookie that lasts 7 days. It is `HttpOnly` (page scripts can't read
+  it), `SameSite=Lax`, and `Secure` on Vercel and anywhere behind HTTPS (only plain `http://` on your own computer
+  leaves `Secure` out, or the browser would never send it back). The server keeps no list of sessions: the cookie is
+  an expiry time signed with HMAC-SHA256, using a key made from `APP_PASSWORD`. It can't be forged or extended, and it
+  never contains the password.
+- **Signing everyone out:** change `APP_PASSWORD` in Vercel and redeploy. Every old cookie stops working at once.
+  `SESSION_SECRET` is optional: if you set it, it is mixed into the signing key too (changing it also signs everyone
+  out, without changing the password). You don't need to add it.
+- **Log out** is the button at the right end of the top bar. It removes the cookie from that browser.
+- **Wrong passwords:** 10 wrong tries from one address lock sign-in for that address for 15 minutes (people already
+  signed in keep working). The password is compared in constant time. On Vercel the count is kept in the running
+  server's memory, so it can restart when Vercel starts a fresh copy of the server; use a long password.
+- Put the site behind HTTPS when it is online (Vercel, Render, Railway, Fly.io and similar do this for you).
+- After sign-in the server only serves `index.html`, `app.js` and `engine.js`, never `.env` or the server code.
 
 ## Tests
 

@@ -105,6 +105,9 @@ header.top { position: sticky; top: 0; z-index: 10; display: flex; align-items: 
 .pill.live { background: var(--good-soft); color: var(--good); }
 .pill.live::before { animation: livepulse 2.4s ease-out infinite; }
 .savestate { display: flex; align-items: center; justify-content: flex-end; gap: 6px; min-width: 74px; font-size: 12.5px; color: var(--muted); }
+.logout { margin: 0; }
+.logout .btn { color: var(--muted); }
+.logout .btn:hover { color: var(--ink); }
 .savestate::before { font-weight: 700; }
 .savestate[data-state="saving"]::before { content: ""; width: 12px; height: 12px; border-radius: 50%; border: 2px solid var(--line-2); border-top-color: var(--accent); animation: spin .7s linear infinite; }
 .savestate[data-state="saved"]::before { content: "✓"; color: var(--good); animation: pop .35s var(--ease); }
@@ -435,6 +438,9 @@ dialog[open] .stack { animation: growx .9s var(--ease) .5s backwards; }
   .top .spacer { display: none; }
   .brand-m { display: flex; margin-right: auto; }
   .savestate { order: 2; min-width: 0; }
+  .logout { order: 2; }
+  .logout .btn { min-height: 36px; padding: 6px 9px; }
+  .logout .btn span { display: none; }
   .month { order: 3; flex: 1 0 100%; justify-content: space-between; height: 44px; }
   .month button { width: 44px; height: 36px; }
   .pagehead .btn { flex: 1; }
@@ -502,6 +508,7 @@ dialog[open] .stack { animation: growx .9s var(--ease) .5s backwards; }
     <span id="modePill" class="pill live hide"></span>
     <span class="spacer"></span>
     <div class="savestate" id="saveState"></div>
+    <form id="logoutForm" class="logout hide" method="post" action="/logout"><button class="btn ghost" type="submit" title="Log out" aria-label="Log out"><svg class="i" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M10 4.5H6.5a2 2 0 0 0-2 2v11a2 2 0 0 0 2 2H10"/><path d="M15.5 8l4 4-4 4M19.5 12H9.5"/></svg><span>Log out</span></button></form>
   </header>
   <div class="wrap">
     <div id="banners"></div>
