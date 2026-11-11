@@ -1,0 +1,12 @@
+{
+  "name": "glana-pay-calculator",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Glana monthly pay calculator: base + performance bonus from Jira tasks, office hours and ethics incidents.",
+  "scripts": {
+    "test": "node test_engine.js",
+    "test:e2e": "node tests/e2e.js",
+    "start": "npx --yes http-server -p 8080 -c-1 ."
+  },
+  "license": "UNLICENSED"
+}

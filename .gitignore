@@ -1,0 +1,4 @@
+node_modules/
+tests/screenshots/
+tests/*.tmp.json
+.DS_Store
