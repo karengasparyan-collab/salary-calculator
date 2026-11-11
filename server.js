@@ -10,14 +10,17 @@
  *   APP_PASSWORD                 password for the website (user name APP_USER, default "glana").
  *                                Required unless the server only listens on this computer.
  *   PORT, HOST                   default 8080; 127.0.0.1 without a password, 0.0.0.0 with one
+ *   KV_REST_API_URL / _TOKEN     shared database (Upstash Redis, added by Vercel). Without it, a normal
+ *                                computer saves to data/db.json; on Vercel the app falls back to the browser.
  *
- * Run: node server.js   (Node 18 or newer, no packages needed) */
+ * Run: node server.js   (Node 18 or newer, no packages needed). On Vercel, api/index.js runs the same handler. */
 "use strict";
 const http = require("http");
 const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
 const E = require("./engine.js");
+const DB = require("./store.js");
 
 const ROOT = __dirname;
 /** Only these files are served. Everything else (server.js, .env, tests…) is never sent. */
@@ -56,6 +59,8 @@ function configFromEnv(env) {
     password,
     port: Number(env.PORT) || 8080,
     host: env.HOST || (password ? "0.0.0.0" : "127.0.0.1"),
+    trustProxy: !!env.VERCEL, // behind Vercel the visitor's address is in X-Forwarded-For
+    hosted: !!env.VERCEL,
   };
 }
 const isLoopback = (h) => h === "127.0.0.1" || h === "::1" || h === "localhost";
@@ -67,6 +72,12 @@ function send(res, status, body, headers) {
   res.end(isJson ? JSON.stringify(body) : body);
 }
 function readBody(req, limit) {
+  // On Vercel the platform may already have read the body (req.body); elsewhere it is read from the stream.
+  if (Object.prototype.hasOwnProperty.call(req, "body") || (req.body !== undefined && !req.readable)) {
+    let b; try { b = req.body; } catch (e) { return Promise.reject(new SyntaxError("bad body")); }
+    const text = b == null ? "" : Buffer.isBuffer(b) ? b.toString("utf8") : typeof b === "string" ? b : JSON.stringify(b);
+    return Buffer.byteLength(text) > limit ? Promise.reject({ status: 413 }) : Promise.resolve(text);
+  }
   return new Promise((resolve, reject) => {
     let size = 0; const chunks = [];
     req.on("data", (c) => { size += c.length; if (size > limit) { reject({ status: 413 }); req.destroy(); } else chunks.push(c); });
@@ -156,15 +167,60 @@ async function searchJira(cfg, search, fetchImpl) {
   };
 }
 
+// ---------- shared data ----------
+async function handleDb(req, res, url, store) {
+  if (!store) return send(res, 503, { code: "no_database", message: "The shared database isn't connected." });
+  try {
+    if (req.method === "GET" && url.pathname === "/api/db") {
+      const since = url.searchParams.get("since");
+      if (since != null && Number(since) === (await store.rev())) return send(res, 200, { unchanged: true, rev: Number(since) });
+      return send(res, 200, await store.all());
+    }
+    if (req.method === "GET" && url.pathname === "/api/db/doc") {
+      const p = url.searchParams.get("path");
+      if (!DB.validPath(p)) return send(res, 400, { code: "invalid_argument", message: "Unknown document path." });
+      return send(res, 200, { path: p, data: await store.get(p) });
+    }
+    if (req.method === "POST" && url.pathname === "/api/db") {
+      const body = JSON.parse(await readBody(req, 3 * 1024 * 1024));
+      const ops = Array.isArray(body && body.ops) ? body.ops : [];
+      if (!ops.length || ops.length > 50) return send(res, 400, { code: "invalid_argument", message: "Send 1 to 50 changes." });
+      const results = [];
+      for (const op of ops) results.push(await DB.applyOp(store, op));
+      return send(res, 200, { results, rev: await store.rev() });
+    }
+    if (req.method === "PUT" && url.pathname === "/api/db") {
+      const body = JSON.parse(await readBody(req, 4 * 1024 * 1024));
+      const bad = DB.checkAll(body && body.docs);
+      if (bad) return send(res, 400, { code: "invalid_argument", message: bad });
+      await store.replaceAll(body.docs);
+      return send(res, 200, await store.all());
+    }
+    return send(res, 405, { code: "bad_request", message: "Not allowed." });
+  } catch (e) {
+    if (e instanceof SyntaxError) return send(res, 400, { code: "invalid_argument", message: "Send JSON." });
+    if (e && e.status === 413) return send(res, 413, { code: "invalid_argument", message: "Too large." });
+    if (e && e.status && e.code) return send(res, e.status, { code: e.code, message: e.message });
+    throw e;
+  }
+}
+
 // ---------- server ----------
-function createServer(cfg, opts) {
+/** The request handler, shared by the Node server below and Vercel (api/index.js).
+ *  opts.store: shared database (store.js) or null; opts.fetch: for tests. */
+function createHandler(cfg, opts) {
   opts = opts || {};
   const fetchImpl = opts.fetch || globalThis.fetch;
+  const store = opts.store || null;
   const fails = new Map(); // ip -> [timestamps] of wrong passwords
-  return http.createServer(async (req, res) => {
+  return async (req, res) => {
     try {
       const url = new URL(req.url, "http://x");
-      const ip = req.socket.remoteAddress || "";
+      const fwd = cfg.trustProxy ? String(req.headers["x-forwarded-for"] || "").split(",")[0].trim() : "";
+      const ip = fwd || (req.socket && req.socket.remoteAddress) || "";
+      if (cfg.hosted && !cfg.password) {
+        return send(res, 503, "This site is locked until APP_PASSWORD is set (Vercel: Settings → Environment Variables), then redeploy.", { "Content-Type": "text/plain; charset=utf-8" });
+      }
       if (cfg.password) {
         const now = Date.now(); const recent = (fails.get(ip) || []).filter((t) => now - t < 15 * 60000);
         if (recent.length >= 10) return send(res, 429, "Too many wrong passwords. Try again in 15 minutes.", { "Content-Type": "text/plain; charset=utf-8" });
@@ -175,8 +231,9 @@ function createServer(cfg, opts) {
         fails.delete(ip);
       }
       if (req.method === "GET" && url.pathname === "/api/status") {
-        return send(res, 200, { ok: true, jira: !!(cfg.jiraEmail && cfg.jiraToken), site: cfg.jiraSite });
+        return send(res, 200, { ok: true, jira: !!(cfg.jiraEmail && cfg.jiraToken), site: cfg.jiraSite, db: store ? store.kind : null, hosted: !!cfg.hosted });
       }
+      if (url.pathname === "/api/db" || url.pathname === "/api/db/doc") return await handleDb(req, res, url, store);
       if (url.pathname === "/api/jira/search") {
         if (req.method !== "POST") return send(res, 405, { code: "bad_request", message: "Use POST." });
         if (!cfg.jiraEmail || !cfg.jiraToken) return send(res, 503, { code: "not_configured", message: "Set JIRA_EMAIL and JIRA_API_TOKEN on the server." });
@@ -197,8 +254,9 @@ function createServer(cfg, opts) {
       console.error(e);
       if (!res.headersSent) send(res, 500, { code: "server_error", message: "Something went wrong on the server." });
     }
-  });
+  };
 }
+function createServer(cfg, opts) { return http.createServer(createHandler(cfg, opts)); }
 
 if (require.main === module) {
   loadEnvFile(path.join(ROOT, ".env"));
@@ -207,11 +265,13 @@ if (require.main === module) {
     console.error("Refusing to start: set APP_PASSWORD before listening on " + cfg.host + " (salaries are confidential).");
     process.exit(1);
   }
-  createServer(cfg).listen(cfg.port, cfg.host, () => {
+  const store = DB.storeFromEnv(process.env, ROOT);
+  createServer(cfg, { store }).listen(cfg.port, cfg.host, () => {
     console.log(`Glana Pay running at http://${cfg.host === "0.0.0.0" ? "localhost" : cfg.host}:${cfg.port}`);
     console.log(cfg.jiraEmail && cfg.jiraToken ? `Jira: ${cfg.jiraSite} as ${cfg.jiraEmail}` : "Jira: not connected (set JIRA_EMAIL and JIRA_API_TOKEN). CSV upload still works.");
     console.log(cfg.password ? `Website password: on (user "${cfg.user}")` : "Website password: off (only this computer can open it)");
+    console.log(store ? `Shared data: ${store.kind === "file" ? "data/db.json" : store.kind}` : "Shared data: none");
   });
 }
 
-module.exports = { createServer, configFromEnv, buildSearch, slimIssue, searchJira };
+module.exports = { createServer, createHandler, configFromEnv, buildSearch, slimIssue, searchJira };

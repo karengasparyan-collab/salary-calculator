@@ -3,3 +3,4 @@ tests/screenshots/
 tests/*.tmp.json
 .DS_Store
 .env
+data/

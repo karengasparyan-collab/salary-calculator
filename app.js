@@ -39,11 +39,12 @@ const scCls = (v) => v >= 80 ? "good" : v >= 50 ? "warn" : "bad";
 const prio = (p) => p ? `<span class="prio" data-p="${esc(String(p).toLowerCase())}">${esc(p)}</span>` : "—";
 const mixBar = (base, bonus, extra) => `<div class="stack" aria-hidden="true"><span class="s-base" style="flex:${Math.max(0, base)} 0 0"></span><span class="s-bonus" style="flex:${Math.max(0, bonus)} 0 0"></span>${extra > 0 ? `<span class="s-extra" style="flex:${extra} 0 0"></span>` : ""}</div>`;
 
-// ---------------- local store (browser storage, fallback, sample mode) ----------------
+// ---------------- store (shared server, browser storage, fallback, sample mode) ----------------
 /** Same interface as the Claude artifact db (doc / collection / onSnapshot).
- *  With `storageKey`, every write is persisted to localStorage and other tabs are kept in sync;
- *  without it, data lives in memory only (sample mode). */
-function MemDB(storageKey) {
+ *  With `remote` (ServerDB), the Glana server is the source of truth: every write goes there first and
+ *  sync() picks up other people's changes. With `storageKey`, writes are kept in this browser's
+ *  localStorage. With neither, data lives in memory only (sample mode). */
+function MemDB(storageKey, remote) {
   const docs = new Map(); const listeners = new Set();
   const parent = (p) => p.split("/").slice(0, -1).join("/");
   const merge = (a, b) => { const o = Object.assign({}, a); for (const k in b) { o[k] = b[k] && typeof b[k] === "object" && !Array.isArray(b[k]) && a && typeof a[k] === "object" && !Array.isArray(a[k]) ? merge(a[k], b[k]) : clone(b[k]); } return o; };
@@ -67,15 +68,34 @@ function MemDB(storageKey) {
     }
     notify();
   };
+  /** Send one change to the server, then keep what the server stored. */
+  let writes = 0, epoch = 0;
+  const remoteWrite = async (op) => {
+    writes++; epoch++;
+    try { const r = await remote.write(op); commit(op.path, r.data == null ? undefined : r.data); }
+    finally { writes--; epoch++; }
+  };
+  /** Replace the cache with a server snapshot; tell listeners only if something changed. */
+  const refresh = (all) => {
+    const next = new Map(Object.entries(all || {}).filter(([, v]) => v && typeof v === "object"));
+    if (JSON.stringify([...next].sort()) === JSON.stringify([...docs].sort())) return false;
+    docs.clear(); next.forEach((v, k) => docs.set(k, v)); notify(); return true;
+  };
+  /** Pick up changes made by others, unless one of our own saves is still on its way. */
+  const sync = async () => {
+    if (!remote || writes) return false;
+    const e = epoch; const all = await remote.poll();
+    return !!all && e === epoch && !writes && refresh(all);
+  };
   const snap = (path) => { const d = docs.get(path); return { id: path.split("/").pop(), exists: !!d, data: () => (d ? clone(d) : undefined), metadata: { fromCache: false, hasPendingWrites: false } }; };
   const qsnap = (path) => { const list = [...docs.keys()].filter((k) => parent(k) === path).sort().map(snap); return { docs: list, size: list.length, empty: !list.length, docChanges: () => [], metadata: { fromCache: false, hasPendingWrites: false } }; };
   function docRef(path) {
     return {
       id: path.split("/").pop(), path,
-      get: async () => snap(path),
-      set: async (d) => { commit(path, clone(d)); },
-      update: async (d) => { if (!docs.has(path)) throw { code: "invalid_argument", message: "missing" }; commit(path, merge(docs.get(path), d)); },
-      delete: async () => { commit(path, undefined); },
+      get: async () => { if (remote) { const d = await remote.readDoc(path); if (d) docs.set(path, d); else docs.delete(path); } return snap(path); },
+      set: async (d) => { if (remote) return remoteWrite({ op: "set", path, data: clone(d) }); commit(path, clone(d)); },
+      update: async (d) => { if (remote) return remoteWrite({ op: "update", path, data: clone(d) }); if (!docs.has(path)) throw { code: "invalid_argument", message: "missing" }; commit(path, merge(docs.get(path), d)); },
+      delete: async () => { if (remote) return remoteWrite({ op: "delete", path }); commit(path, undefined); },
       onSnapshot(next) { const l = () => next(snap(path)); listeners.add(l); setTimeout(l, 0); return () => listeners.delete(l); },
       collection: (c) => colRef(path + "/" + c),
     };
@@ -94,6 +114,7 @@ function MemDB(storageKey) {
   const exportAll = () => clone(Object.fromEntries(docs));
   /** Restore: replace everything with a backup made by exportAll. */
   const importAll = async (all) => {
+    if (remote) { writes++; epoch++; try { refresh(await remote.replaceAll(all)); } finally { writes--; epoch++; } return; }
     const before = new Map(docs);
     docs.clear();
     for (const [k, v] of Object.entries(all)) if (v && typeof v === "object") docs.set(k, clone(v));
@@ -103,13 +124,36 @@ function MemDB(storageKey) {
     }
     notify();
   };
-  return { doc: docRef, collection: colRef, exportAll, importAll };
+  return { doc: docRef, collection: colRef, exportAll, importAll, refresh, sync };
 }
 const STORE_KEY = "glanaPay.db.v1";
 
+/** Talks to the Glana server's shared data (server.js → /api/db). */
+function ServerDB() {
+  let rev = null;
+  async function req(method, url, body) {
+    let res, data = null;
+    try { res = await fetch(url, { method, credentials: "same-origin", headers: body ? { "Content-Type": "application/json" } : {}, body: body ? JSON.stringify(body) : undefined }); }
+    catch (e) { throw { code: "unavailable" }; }
+    try { data = await res.json(); } catch (e) {}
+    if (res.status === 401) throw { code: "login_required" };
+    if (!res.ok) throw { code: res.status >= 500 ? "unavailable" : (data && data.code) || "invalid_argument", message: data && data.message };
+    return data;
+  }
+  return {
+    async loadAll() { const d = await req("GET", "api/db"); rev = d.rev; return d.docs; },
+    /** Everything again if anyone changed anything since the last look, else null. */
+    async poll() { const d = await req("GET", "api/db" + (rev == null ? "" : "?since=" + rev)); if (d.unchanged) return null; rev = d.rev; return d.docs; },
+    async readDoc(path) { return (await req("GET", "api/db/doc?path=" + encodeURIComponent(path))).data; },
+    // Our own writes don't move `rev` here, so the next poll also sees changes others made in between.
+    async write(op) { return (await req("POST", "api/db", { ops: [op] })).results[0]; },
+    async replaceAll(docs) { const d = await req("PUT", "api/db", { docs }); rev = d.rev; return d.docs; },
+  };
+}
+
 // ---------------- state ----------------
 const S = {
-  db: null, mode: "loading", // live (inside Claude) | browser (saved in this browser) | local (not saving) | sample
+  db: null, mode: "loading", // live (inside Claude) | server (shared, on the Glana server) | browser (this browser only) | local (not saving) | sample
   canEdit: true, downloads: null,
   settings: clone(E.DEFAULT_SETTINGS), settingsStored: false,
   team: [], month: E.monthAdd(new Date().toISOString().slice(0, 7), -1),
@@ -138,11 +182,12 @@ function setSave(txt) { $("#saveState").textContent = txt; }
 async function write(fn, okMsg) {
   if (!S.canEdit) { toast("You can view this calculator but not change it."); return false; }
   saving++; setSave("Saving…");
-  try { await fn(); setSave(S.mode === "live" || S.mode === "browser" ? "Saved" : ""); if (okMsg) toast(okMsg); return true; }
+  try { await fn(); setSave(S.mode === "live" || S.mode === "server" || S.mode === "browser" ? "Saved" : ""); if (okMsg) toast(okMsg); return true; }
   catch (e) {
     let msg = "Could not save. Try again.";
     if (e && e.code === "invalid_argument") { msg = "This change was refused (no edit access, or the data is too large)."; }
     if (e && e.code === "quota_exceeded") msg = "Storage is full. Delete old months to free space.";
+    if (e && e.code === "login_required") msg = "Your sign-in expired. Reload the page and enter the password.";
     if (e && e.code === "unavailable") { try { await new Promise((r) => setTimeout(r, 400 + Math.random() * 600)); await fn(); setSave("Saved"); return true; } catch (e2) {} }
     setSave("Not saved"); toast(msg); return false;
   } finally { saving--; }
@@ -243,7 +288,9 @@ function render() {
 }
 function renderBanners() {
   const b = [];
-  if (S.mode === "local") b.push(`<div class="banner"><span class="grow"><b>Not saving.</b> This browser blocks saved data (private window or storage turned off). Changes here are lost on reload.</span><button class="btn" data-action="sample">Try sample data</button></div>`);
+  if (S.mode === "local") b.push(`<div class="banner"><span class="grow"><b>Not saving.</b> ${S.loadError ? esc(S.loadError) : "This browser blocks saved data (private window or storage turned off). Changes here are lost on reload."}</span><button class="btn" data-action="sample">Try sample data</button></div>`);
+  if (S.mode === "browser" && S.jiraServer && S.jiraServer.hosted) b.push(`<div class="banner"><span class="grow"><b>Shared database not connected.</b> For now, data is saved only in this browser. In Vercel, add Upstash for Redis under Storage, then redeploy.</span></div>`);
+  if (S.mode === "server" && S.loaded.team && !S.team.length) b.push(`<div class="banner info"><span class="grow"><b>Welcome.</b> Everything you enter is saved on the Glana server and shared with everyone who has the password. Add the team to start, or look around with sample data first.</span><button class="btn" data-action="sample">Try sample data</button></div>`);
   if (S.mode === "browser" && S.loaded.team && !S.team.length) b.push(`<div class="banner info"><span class="grow"><b>Welcome.</b> Everything you enter is saved in this browser on this computer. Add the team to start, or look around with sample data first.</span><button class="btn" data-action="sample">Try sample data</button></div>`);
   if (S.mode === "sample") b.push(`<div class="banner info"><span class="grow"><b>Sample data.</b> Three example employees for November 2026 (Ani is the worked example from the pay document). Nothing here is saved.</span><button class="btn" data-action="exit-sample">Back to real data</button></div>`);
   if (S.slow) b.push(`<div class="banner"><span class="grow">Saved data can't be reached yet. What you see may be out of date.</span></div>`);
@@ -599,7 +646,7 @@ function viewSettings() {
     </div>
   </div>
   <div class="card pad section"><h3 style="margin-top:0">Public holidays (Armenia)</h3><p class="small muted" style="margin-top:0">One date per line (YYYY-MM-DD). Not counted as working days or late days. Add government-announced extra days off here.</p><textarea data-set="holidays" data-live="0" style="min-height:140px">${esc(c.holidays.join("\n"))}</textarea></div>
-  ${S.mode === "browser" ? `<div class="card pad section"><h3 style="margin-top:0">Backup</h3><p class="small muted" style="margin-top:0">Everything (team, salaries, months, tasks, incidents, settings) is saved in this browser only. Download a backup regularly, and use it to move the data to another computer. Clearing the browser's site data deletes it.</p><div class="row"><button class="btn" data-action="backup-download">${ICON.download}Download backup</button><label class="btn">${ICON.upload}Restore from backup<input type="file" accept=".json,application/json" data-file="backup" hidden></label></div></div>` : ""}
+  ${S.mode === "browser" || S.mode === "server" ? `<div class="card pad section"><h3 style="margin-top:0">Backup</h3><p class="small muted" style="margin-top:0">${S.mode === "server" ? "Everything (team, salaries, months, tasks, incidents, settings) is saved on the Glana server. Download a backup now and then to keep a copy of your own. Restoring replaces the shared data for everyone." : "Everything (team, salaries, months, tasks, incidents, settings) is saved in this browser only. Download a backup regularly, and use it to move the data to another computer. Clearing the browser's site data deletes it."}</p><div class="row"><button class="btn" data-action="backup-download">${ICON.download}Download backup</button><label class="btn">${ICON.upload}Restore from backup<input type="file" accept=".json,application/json" data-file="backup" hidden></label></div></div>` : ""}
   <div class="row section savebar"><button class="btn primary" data-action="settings-save">Save settings</button><button class="btn ghost" data-action="settings-reset">Reset to document defaults</button><span class="small muted">${S.settingsStored ? "Custom settings saved." : "Using the document defaults."}</span></div>`;
 }
 
@@ -721,11 +768,11 @@ function backupDownload() {
   download(`Glana pay backup ${new Date().toISOString().slice(0, 10)}.json`, JSON.stringify(data, null, 1));
 }
 async function restoreBackup(text) {
-  if (S.mode !== "browser" || !S.db.importAll) return toast("Restore works only for data saved in this browser.");
+  if ((S.mode !== "browser" && S.mode !== "server") || !S.db.importAll) return toast("Restore works only for data saved in this browser or on the Glana server.");
   let data; try { data = JSON.parse(text); } catch (e) { return toast("This file is not a Glana pay backup."); }
   if (!data || data.app !== "glana-pay" || !data.docs || typeof data.docs !== "object") return toast("This file is not a Glana pay backup.");
   const n = Object.keys(data.docs).filter((k) => k.startsWith("team/")).length;
-  if (!confirm(`Replace all data in this browser with the backup from ${data.exportedAt ? new Date(data.exportedAt).toLocaleString() : "an unknown date"} (${n} employees)? This cannot be undone.`)) return;
+  if (!confirm(`Replace all ${S.mode === "server" ? "shared data (for everyone)" : "data in this browser"} with the backup from ${data.exportedAt ? new Date(data.exportedAt).toLocaleString() : "an unknown date"} (${n} employees)? This cannot be undone.`)) return;
   if (await write(() => S.db.importAll(data.docs), "Backup restored")) { S.editing = null; subscribeAll(); render(); }
 }
 function standaloneSlip(r) {
@@ -934,6 +981,7 @@ async function findServer() {
 }
 async function boot() {
   S.mode = "loading"; render();
+  clearInterval(S.syncTimer);
   let db = null, user = null;
   const cl = window.claude;
   if (cl && typeof cl.use === "function") {
@@ -944,11 +992,22 @@ async function boot() {
     if (user) { try { const ok = await user.canEdit(); S.canEdit = ok !== false; } catch (e) {} }
   } else {
     // Standalone website: keep the data in this browser. If storage is blocked, run in memory and say so.
-    S.downloads = null; S.mcp = null; S.canEdit = true;
+    S.downloads = null; S.mcp = null; S.canEdit = true; S.loadError = "";
     S.jiraServer = await findServer();
-    try { S.db = MemDB(STORE_KEY); S.mode = "browser"; } catch (e) { S.db = MemDB(); S.mode = "local"; }
+    if (S.jiraServer && S.jiraServer.db) {
+      // Shared data on the Glana server: everyone with the password sees the same numbers.
+      try { const remote = ServerDB(); const all = await remote.loadAll(); S.db = MemDB(null, remote); S.db.refresh(all); S.mode = "server"; }
+      catch (e) { S.db = MemDB(); S.mode = "local"; S.loadError = e && e.code === "login_required" ? "Your sign-in expired. Reload the page and enter the password." : "Couldn't load the shared data from the server. Check the connection and reload the page."; }
+    } else {
+      try { S.db = MemDB(STORE_KEY); S.mode = "browser"; } catch (e) { S.db = MemDB(); S.mode = "local"; }
+    }
   }
   subscribeAll(); render();
+  if (S.mode === "server") {
+    const sync = () => { if (S.mode === "server" && document.visibilityState !== "hidden" && S.db.sync) S.db.sync().catch(() => {}); };
+    S.syncTimer = setInterval(sync, 8000);
+    if (!S.syncBound) { S.syncBound = true; window.addEventListener("focus", () => S.mode === "server" && S.db.sync && S.db.sync().catch(() => {})); }
+  }
 }
 render();
 boot();

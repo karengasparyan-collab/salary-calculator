@@ -9,6 +9,7 @@ const { chromium } = require("playwright");
 const E = require("../engine.js");
 const { createServer, configFromEnv } = require("../server.js");
 const { startFakeJira } = require("./fake_jira.js");
+const { MemoryStore } = require("../store.js");
 
 const ROOT = path.join(__dirname, "..");
 const SHOTS = path.join(__dirname, "screenshots");
@@ -233,7 +234,8 @@ async function step(name, fn) {
 
   // ---------- website + Glana server: Pull from Jira ----------
   const jira = await startFakeJira();
-  const app = createServer(configFromEnv({ JIRA_BASE_URL: jira.url, JIRA_EMAIL: "bot@example.com", JIRA_API_TOKEN: "secret-token", APP_PASSWORD: "pw-123" }));
+  const shared = MemoryStore();
+  const app = createServer(configFromEnv({ JIRA_BASE_URL: jira.url, JIRA_EMAIL: "bot@example.com", JIRA_API_TOKEN: "secret-token", APP_PASSWORD: "pw-123" }), { store: shared });
   await new Promise((r) => app.listen(0, "127.0.0.1", r));
   const appUrl = `http://127.0.0.1:${app.address().port}/`;
   await step("server: wrong password shows nothing", async () => {
@@ -247,8 +249,9 @@ async function step(name, fn) {
   sp.on("pageerror", (e) => errors.push(e.message));
   await step("server: Pull from Jira → 820,800", async () => {
     await sp.goto(appUrl);
-    await sp.waitForFunction(() => window.__glana && window.__glana.S.mode === "browser");
-    assert.deepStrictEqual(await sp.evaluate(() => window.__glana.S.jiraServer), { ok: true, jira: true, site: "glana.atlassian.net" });
+    await sp.waitForFunction(() => window.__glana && window.__glana.S.mode === "server");
+    assert.deepStrictEqual(await sp.evaluate(() => window.__glana.S.jiraServer), { ok: true, jira: true, site: "glana.atlassian.net", db: "memory", hosted: false });
+    assert.match(await sp.innerText("#banners"), /shared with everyone who has the password/);
     await sp.click('nav.tabs [data-tab="team"]');
     await sp.fill('form[data-form="member"] [name=name]', "Ani");
     await sp.fill('form[data-form="member"] [name=jiraName]', "Ani Example");
@@ -293,6 +296,43 @@ async function step(name, fn) {
     assert.match(await sp.innerText(".pullcard .banner"), /JIRA_EMAIL and JIRA_API_TOKEN/);
     assert.strictEqual(await sp.evaluate(() => window.__glana.S.tasks.length), 14, "earlier pull kept");
   });
+  await step("shared: nothing is kept in the browser, the server has it", async () => {
+    assert.strictEqual(await sp.evaluate(() => localStorage.getItem("glanaPay.db.v1")), null);
+    const { docs } = await shared.all();
+    assert.strictEqual(docs["team/" + Object.keys(docs).find((k) => k.startsWith("team/")).split("/")[1]].salary, 900000);
+    assert.ok(docs["months/2026-11"].hours);
+  });
+  // second founder, separate browser profile
+  const bctx = await browser.newContext({ viewport: { width: 1280, height: 900 }, httpCredentials: { username: "glana", password: "pw-123" } });
+  bctx.setDefaultTimeout(8000);
+  const bp = await bctx.newPage();
+  bp.on("pageerror", (e) => errors.push(e.message));
+  await step("shared: the other founder sees the same 820,800", async () => {
+    await bp.goto(appUrl);
+    await bp.waitForFunction(() => window.__glana && window.__glana.S.mode === "server" && window.__glana.S.team.length === 1);
+    for (let i = 0; i < 48 && (await bp.evaluate(() => window.__glana.S.month)) !== "2026-11"; i++) {
+      const m = await bp.evaluate(() => window.__glana.S.month);
+      await bp.click(m < "2026-11" ? '[data-action="month-next"]' : '[data-action="month-prev"]');
+    }
+    await bp.waitForFunction(() => window.__glana.results()[0] && window.__glana.results()[0].total === 820800);
+    await bp.click('nav.tabs [data-tab="payroll"]');
+    assert.match((await bp.locator("tbody tr.click").first().innerText()).replace(/\s+/g, " "), /820,800/);
+  });
+  await step("shared: a change by one founder reaches the other", async () => {
+    await bp.click('nav.tabs [data-tab="incidents"]');
+    await bp.selectOption('form[data-form="incident"] [name=level]', "critical");
+    await bp.fill('form[data-form="incident"] [name=note]', "Leaked data");
+    await bp.click('form[data-form="incident"] button[type=submit]');
+    await bp.waitForSelector('td:has-text("Leaked data")');
+    // the first founder's page picks it up on its own (checks every 8 s or on focus)
+    await sp.waitForFunction(() => window.__glana.results()[0].total === 720000, null, { timeout: 15000 });
+  });
+  await step("shared: reload loads from the server", async () => {
+    await sp.reload();
+    await sp.waitForFunction(() => window.__glana && window.__glana.S.mode === "server" && window.__glana.S.team.length === 1);
+    assert.strictEqual(await sp.evaluate(() => window.__glana.S.jiraServer.db), "memory");
+  });
+  await bctx.close();
   await sctx.close(); app.close(); jira.close();
 
   await step("no errors in the browser console", async () => assert.deepStrictEqual(errors, [], JSON.stringify(errors)));
