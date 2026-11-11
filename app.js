@@ -115,7 +115,7 @@ const S = {
   team: [], month: E.monthAdd(new Date().toISOString().slice(0, 7), -1),
   monthDoc: {}, incidents: [], jiraParts: [], tasks: [],
   tab: "payroll", loaded: {}, unsubs: [], monthUnsubs: [], slowTimer: null, slow: false,
-  pendingRender: false, jiraPreview: null, hoursPreview: null, filter: "", mcp: null, pull: null, pageSize: 100,
+  pendingRender: false, jiraPreview: null, hoursPreview: null, filter: "", mcp: null, jiraServer: null, pull: null, pageSize: 100,
 };
 try { const t = localStorage.getItem("glanaPayTab"); if (t) S.tab = t; } catch (e) {}
 
@@ -424,10 +424,14 @@ function viewTasks() {
   const team = activeTeam();
   const pull = S.pull && S.pull.month === S.month ? S.pull : null;
   const running = pull && pull.state === "running";
-  const canPull = !!S.mcp && S.mode === "live";
+  const canPull = jiraSource() !== null;
+  const pullNote = S.mode === "sample" ? "Not available with sample data."
+    : canPull ? (jiraSource() === "mcp" ? "Reads Jira with your Atlassian connection. Nothing in Jira is changed." : `Reads ${esc(S.jiraServer.site || "Jira")} through the Glana server. Nothing in Jira is changed.`)
+    : S.jiraServer ? "The server has no Jira token yet (JIRA_EMAIL and JIRA_API_TOKEN). Upload the CSV export below for now."
+    : "Direct pull needs the Glana server (npm start). Upload the CSV export below.";
   let html = `<h2>Jira tasks</h2><p class="sub">Pulls the tasks finished in ${esc(monthName(S.month))} on ${esc(c.jiraProjects)}. Each month is scored on its own tasks only. Pull again any time to refresh.</p>`;
   html += `<div class="card pad pullcard"><div class="row"><span class="tile" aria-hidden="true">${ICON.tasks}</span><button class="btn primary" data-action="jira-pull" ${!canPull || running ? "disabled" : ""}>${running ? ICON.spin : ICON.refresh}${running ? `Pulling…` : meta ? "Pull again from Jira" : "Pull from Jira"}</button>
-    <span class="small muted">${canPull ? "Reads Jira with your Atlassian connection. Nothing in Jira is changed." : S.mode === "sample" ? "Not available with sample data." : "Direct pull isn't connected on this site yet. Upload the CSV export below."}</span></div>
+    <span class="small muted">${pullNote}</span></div>
     ${running ? `<div class="loadbar"></div><p class="small muted" style="margin:8px 0 0">Reading Jira… ${pull.count ? pull.count + " tasks found so far" : ""}</p>` : ""}
     ${pull && pull.state === "error" ? `<div class="banner" style="margin-top:12px"><span class="grow">${esc(pull.message)}</span></div>` : ""}
     <details style="margin-top:12px"${canPull ? "" : " open"}><summary class="small muted">Or upload a CSV export instead</summary>
@@ -753,13 +757,37 @@ function pullError(e) {
     server_unavailable: "Jira didn't answer in time. Try again in a minute.",
     bad_shape: "Jira answered in a format the calculator didn't expect. A sample was saved for Claude to check. Use the CSV upload for now.",
     tool_error: "Jira refused the search: " + ((e && e.message) || "unknown error"),
+    jira_auth: "Jira refused the server's e-mail / API token. Check JIRA_EMAIL and JIRA_API_TOKEN on the server, then restart it.",
+    not_configured: "The server has no Jira token yet. Set JIRA_EMAIL and JIRA_API_TOKEN, then restart it.",
+    login_required: "Your sign-in to this site expired. Reload the page and enter the password.",
+    bad_request: "The server refused the request: " + ((e && e.message) || "unknown error"),
   }[code];
   return msg || `Couldn't pull from Jira (${code}). You can upload a CSV export instead.`;
 }
-async function callJira(input) {
-  try { return await S.mcp.callTool(JIRA_SERVER, JIRA_TOOL, input, { cache: false }); }
+/** Where Jira is read from: the Atlassian connector inside Claude, the Glana server on the website, or nowhere. */
+function jiraSource() {
+  if (S.mode === "sample" || S.mode === "loading") return null;
+  if (S.mcp && S.mode === "live") return "mcp";
+  if (S.jiraServer && S.jiraServer.jira) return "server";
+  return null;
+}
+/** One page from the Glana server (server.js builds the JQL and holds the token). */
+async function serverSearch(input, range) {
+  const body = { from: range[0], to: range[1], projects: cfg().jiraProjects, issueTypes: cfg().issueTypes, maxResults: input.maxResults };
+  if (input.nextPageToken) body.nextPageToken = input.nextPageToken;
+  let res, data = null;
+  try { res = await fetch("api/jira/search", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body), credentials: "same-origin" }); }
+  catch (e) { throw { code: "server_unavailable", retryable: true }; }
+  try { data = await res.json(); } catch (e) {}
+  if (res.status === 401) throw { code: "login_required" };
+  if (!res.ok) throw { code: (data && data.code) || "server_unavailable", message: data && data.message, retryable: res.status === 503 || res.status === 504, retryAfterMs: data && data.retryAfterMs };
+  return data;
+}
+async function callJira(input, range) {
+  const once = () => (jiraSource() === "server" ? serverSearch(input, range) : S.mcp.callTool(JIRA_SERVER, JIRA_TOOL, input, { cache: false }));
+  try { return await once(); }
   catch (e) {
-    if (e && e.retryable) { await new Promise((r) => setTimeout(r, Math.max(800, e.retryAfterMs || 0) + Math.random() * 700)); return await S.mcp.callTool(JIRA_SERVER, JIRA_TOOL, input, { cache: false }); }
+    if (e && e.retryable) { await new Promise((r) => setTimeout(r, Math.max(800, e.retryAfterMs || 0) + Math.random() * 700)); return await once(); }
     throw e;
   }
 }
@@ -782,6 +810,9 @@ function findIssues(node, depth) {
   }
   if (typeof node !== "object") return null;
   if (Array.isArray(node.issues)) return node;
+  // Newer Atlassian connector replies: { issues: { nodes: [...], pageInfo: { hasNextPage, endCursor } } }
+  const conn = node.issues && typeof node.issues === "object" && Array.isArray(node.issues.nodes) ? node.issues : Array.isArray(node.nodes) && node.pageInfo ? node : null;
+  if (conn) { const pi = conn.pageInfo || {}; return { issues: conn.nodes, isLast: pi.hasNextPage !== true, nextPageToken: pi.hasNextPage === true && typeof pi.endCursor === "string" ? pi.endCursor : null }; }
   for (const k of ["payload", "structuredContent", "data", "result", "content", "text", "json", "response", "body"]) {
     if (k in node) { const r = findIssues(node[k], depth + 1); if (r) return r; }
   }
@@ -795,7 +826,7 @@ async function saveDebug(res, input) {
   } catch (e) {}
 }
 async function pullJira() {
-  if (!S.mcp) return toast("Pulling from Jira works when this page is open in Claude. Upload a CSV instead.");
+  if (!jiraSource()) return toast("Pulling from Jira needs the Atlassian connection in Claude or the Glana server. Upload a CSV instead.");
   if (S.pull && S.pull.state === "running") return;
   const c = cfg(); const month = S.month;
   S.pull = { state: "running", count: 0, month }; render();
@@ -817,7 +848,7 @@ async function pullJira() {
         if (++calls > 120) throw { code: "server_unavailable" };
         const input = { cloudId: c.jiraSite, jql, fields: E.JIRA_FIELDS, maxResults: S.pageSize, view: "full" };
         if (token) input.nextPageToken = token;
-        const res = await callJira(input);
+        const res = await callJira(input, [from, to]);
         const d = findIssues(res);
         if (!d) { await saveDebug(res, input); throw { code: "bad_shape" }; }
         for (const it of d.issues) if (it && it.key) byKey.set(it.key, it);
@@ -889,6 +920,18 @@ function startSample() {
 }
 
 // ---------------- boot ----------------
+/** Is this page served by server.js? Returns its status ({ ok, jira, site }) or null (opened as a file, static host). */
+async function findServer() {
+  if (!/^https?:$/.test(location.protocol)) return null;
+  try {
+    const ctrl = typeof AbortController === "function" ? new AbortController() : null;
+    const t = setTimeout(() => ctrl && ctrl.abort(), 4000);
+    const res = await fetch("api/status", { credentials: "same-origin", signal: ctrl && ctrl.signal });
+    clearTimeout(t);
+    const st = res.ok ? await res.json() : null;
+    return st && st.ok === true ? st : null;
+  } catch (e) { return null; }
+}
 async function boot() {
   S.mode = "loading"; render();
   let db = null, user = null;
@@ -902,13 +945,14 @@ async function boot() {
   } else {
     // Standalone website: keep the data in this browser. If storage is blocked, run in memory and say so.
     S.downloads = null; S.mcp = null; S.canEdit = true;
+    S.jiraServer = await findServer();
     try { S.db = MemDB(STORE_KEY); S.mode = "browser"; } catch (e) { S.db = MemDB(); S.mode = "local"; }
   }
   subscribeAll(); render();
 }
 render();
 boot();
-window.__glana = { S, results, E };
+window.__glana = { S, results, E, findIssues };
 })();
 
 /* Presentation only: tab indicator, entrance animations, save-state icon. No data or pay logic here. */

@@ -7,6 +7,8 @@ const path = require("path");
 const assert = require("assert");
 const { chromium } = require("playwright");
 const E = require("../engine.js");
+const { createServer, configFromEnv } = require("../server.js");
+const { startFakeJira } = require("./fake_jira.js");
 
 const ROOT = path.join(__dirname, "..");
 const SHOTS = path.join(__dirname, "screenshots");
@@ -57,7 +59,8 @@ async function step(name, fn) {
   const page = await ctx.newPage();
   const errors = [];
   page.on("pageerror", (e) => errors.push(e.message));
-  page.on("console", (m) => { if (m.type() === "error" && !/fonts\.(googleapis|gstatic)/.test(m.text())) errors.push(m.text()); });
+  // A plain file host has no /api/status: that 404 is how the page knows there is no Glana server.
+  page.on("console", (m) => { if (m.type() === "error" && !/fonts\.(googleapis|gstatic)/.test(m.text()) && !/\/api\/status$/.test(m.location().url || "")) errors.push(m.text() + " " + (m.location().url || "")); });
   page.on("dialog", (d) => d.accept());
 
   const S = () => page.evaluate(() => ({ mode: window.__glana.S.mode, month: window.__glana.S.month, tab: window.__glana.S.tab }));
@@ -215,7 +218,84 @@ async function step(name, fn) {
     await phone.close();
   });
 
-  await step("no errors in the browser console", async () => assert.deepStrictEqual(errors, []));
+  // ---------- Atlassian connector (inside Claude): its newer reply shape must page correctly ----------
+  await step("connector reply { issues: { nodes, pageInfo } } follows the next page", async () => {
+    const reply = { issues: { nodes: [{ key: "GOD-83", fields: { summary: "x", resolutiondate: "2026-10-09T17:42:35.344+0400", assignee: { displayName: "Someone" } } }], pageInfo: { hasNextPage: true, endCursor: "CURSOR-2" } } };
+    const last = { issues: { nodes: [{ key: "PRJ-169", fields: {} }], pageInfo: { hasNextPage: false, endCursor: "CURSOR-3" } } };
+    const [a, b, c] = await page.evaluate(([r1, r2]) => {
+      const f = window.__glana.findIssues;
+      return [f(r1), f(r2), f({ content: [{ type: "text", text: JSON.stringify(r1) }] })];
+    }, [reply, last]);
+    assert.deepStrictEqual([a.issues.length, a.isLast, a.nextPageToken], [1, false, "CURSOR-2"]);
+    assert.deepStrictEqual([b.isLast, b.nextPageToken], [true, null]);
+    assert.deepStrictEqual([c.isLast, c.nextPageToken], [false, "CURSOR-2"]);
+  });
+
+  // ---------- website + Glana server: Pull from Jira ----------
+  const jira = await startFakeJira();
+  const app = createServer(configFromEnv({ JIRA_BASE_URL: jira.url, JIRA_EMAIL: "bot@example.com", JIRA_API_TOKEN: "secret-token", APP_PASSWORD: "pw-123" }));
+  await new Promise((r) => app.listen(0, "127.0.0.1", r));
+  const appUrl = `http://127.0.0.1:${app.address().port}/`;
+  await step("server: wrong password shows nothing", async () => {
+    const c = await browser.newContext({ httpCredentials: { username: "glana", password: "nope" } });
+    const p = await c.newPage(); const r = await p.goto(appUrl);
+    assert.strictEqual(r.status(), 401); await c.close();
+  });
+  const sctx = await browser.newContext({ viewport: { width: 1280, height: 900 }, httpCredentials: { username: "glana", password: "pw-123" } });
+  sctx.setDefaultTimeout(8000);
+  const sp = await sctx.newPage();
+  sp.on("pageerror", (e) => errors.push(e.message));
+  await step("server: Pull from Jira → 820,800", async () => {
+    await sp.goto(appUrl);
+    await sp.waitForFunction(() => window.__glana && window.__glana.S.mode === "browser");
+    assert.deepStrictEqual(await sp.evaluate(() => window.__glana.S.jiraServer), { ok: true, jira: true, site: "glana.atlassian.net" });
+    await sp.click('nav.tabs [data-tab="team"]');
+    await sp.fill('form[data-form="member"] [name=name]', "Ani");
+    await sp.fill('form[data-form="member"] [name=jiraName]', "Ani Example");
+    await sp.fill('form[data-form="member"] [name=salary]', "900000");
+    await sp.click('form[data-form="member"] button[type=submit]');
+    await sp.waitForSelector('td:has-text("720,000")');
+    for (let i = 0; i < 48 && (await sp.evaluate(() => window.__glana.S.month)) !== "2026-11"; i++) {
+      const m = await sp.evaluate(() => window.__glana.S.month);
+      await sp.click(m < "2026-11" ? '[data-action="month-next"]' : '[data-action="month-prev"]');
+    }
+    await sp.click('nav.tabs [data-tab="tasks"]');
+    assert.match(await sp.innerText(".pullcard"), /through the Glana server/);
+    await sp.click('[data-action="jira-pull"]');
+    await sp.waitForSelector("#pullsum", { timeout: 15000 });
+    await sp.waitForTimeout(1600); // count-up animation
+    const sum = (await sp.innerText("#pullsum")).replace(/\s+/g, " ");
+    assert.match(sum, /Pulled for the last 3 months 14 tasks finished/);
+    assert.match(sum, /Counted for November 2026 11 tasks finished this month/);
+    assert.match(sum, /Sep 2026 1 reserve Oct 2026 2 reserve Nov 2026 11 scored/);
+    assert.strictEqual(await sp.locator(".card.tablewrap table tbody tr").count(), 8);
+    await sp.screenshot({ path: path.join(SHOTS, "jira-pull-desktop.png"), fullPage: true });
+    await sp.click('nav.tabs [data-tab="hours"]');
+    await sp.fill('input[data-hours][data-field="worked"]', "162.5"); await sp.keyboard.press("Tab");
+    await sp.fill('input[data-hours][data-field="leave"]', "1"); await sp.keyboard.press("Tab");
+    await sp.click("h2");
+    await sp.click('nav.tabs [data-tab="incidents"]');
+    for (const [level, note] of [["major", "AI slop"], ["minor", "Jira not updated"]]) {
+      await sp.selectOption('form[data-form="incident"] [name=level]', level);
+      await sp.fill('form[data-form="incident"] [name=note]', note);
+      await sp.click('form[data-form="incident"] button[type=submit]');
+      await sp.waitForSelector(`td:has-text("${note}")`);
+    }
+    await sp.waitForFunction(() => window.__glana.results()[0].total === 820800);
+    // 3 months, 3 per page: Sep 1 page, Oct 1 page, Nov 4 pages
+    assert.strictEqual(jira.requests.length, 6);
+  });
+  await step("server: Jira refusing the token shows a clear message", async () => {
+    jira.opts.token = "rotated";
+    await sp.click('nav.tabs [data-tab="tasks"]');
+    await sp.click('[data-action="jira-pull"]');
+    await sp.waitForSelector(".pullcard .banner");
+    assert.match(await sp.innerText(".pullcard .banner"), /JIRA_EMAIL and JIRA_API_TOKEN/);
+    assert.strictEqual(await sp.evaluate(() => window.__glana.S.tasks.length), 14, "earlier pull kept");
+  });
+  await sctx.close(); app.close(); jira.close();
+
+  await step("no errors in the browser console", async () => assert.deepStrictEqual(errors, [], JSON.stringify(errors)));
 
   await browser.close(); server.close();
   console.log(`\n${pass} passed, ${fail} failed`);
