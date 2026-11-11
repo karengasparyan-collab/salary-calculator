@@ -278,6 +278,7 @@ function render() {
   pill.classList.toggle("hide", S.mode === "loading");
   renderBanners();
   renderTabs();
+  renderChrome();
   const v = $("#view");
   const scroll = window.scrollY;
   if (S.mode === "loading") { v.innerHTML = `<div class="empty loading"><div class="sk-grid" aria-hidden="true"><span class="sk"></span><span class="sk"></span><span class="sk"></span><span class="sk"></span></div><span class="sk sk-table" aria-hidden="true"></span><p>Loading saved data…</p></div>`; return; }
@@ -285,6 +286,22 @@ function render() {
   window.scrollTo(0, scroll);
   bindDrops();
   if (S.animatePull && S.tab === "tasks") { clearTimeout(S.animT); S.animT = setTimeout(playPullAnim, 180); }
+}
+/** Browser tab title and the sidebar note that says where the data is kept. Display only. */
+function renderChrome() {
+  const tabLabel = (TABS.find(([k]) => k === S.tab) || [])[1];
+  document.title = S.mode === "loading" || !tabLabel ? "Glana Pay" : `${tabLabel} · ${monthName(S.month)} · Glana Pay`;
+  const where = {
+    live: ["Shared data", "Saved in Claude"],
+    server: ["Shared data", "Saved on the Glana server"],
+    browser: ["This browser only", "Saved on this computer"],
+    local: ["Not saving", "Changes are lost on reload"],
+    sample: ["Sample data", "Nothing here is saved"],
+  }[S.mode] || ["Loading…", ""];
+  const w = $("#dataWhere"), n = $("#dataNote"), f = $("#dataFoot");
+  if (w) w.textContent = where[0];
+  if (n) n.textContent = where[1];
+  if (f) f.title = where.filter(Boolean).join(" · ");
 }
 function renderBanners() {
   const b = [];
@@ -310,7 +327,8 @@ function status() {
 function renderTabs() {
   const st = status();
   const dots = { tasks: st.tasks, hours: st.hours, team: st.team };
-  $("#tabs").innerHTML = TABS.map(([k, label]) => `<button role="tab" aria-selected="${S.tab === k}" data-action="tab" data-tab="${k}"><span class="ico">${ICON[k]}${k in dots ? `<span class="dot ${dots[k] ? "ok" : "todo"}"></span>` : ""}</span><span class="lbl">${label}</span>${k === "incidents" && S.incidents.length ? ` <span class="tag">${S.incidents.length}</span>` : ""}</button>`).join("");
+  const groups = { payroll: "This month", team: "Setup" };
+  $("#tabs").innerHTML = TABS.map(([k, label]) => `${groups[k] ? `<span class="nav-h" role="presentation">${groups[k]}</span>` : ""}<button role="tab" aria-selected="${S.tab === k}" data-action="tab" data-tab="${k}"><span class="ico">${ICON[k]}</span><span class="lbl">${label}</span>${k in dots ? `<span class="dot ${dots[k] ? "ok" : "todo"}" title="${dots[k] ? "Ready" : "Needs attention"}"></span>` : ""}${k === "incidents" && S.incidents.length ? `<span class="tag">${S.incidents.length}</span>` : ""}</button>`).join("");
 }
 
 function playPullAnim() {
@@ -379,6 +397,7 @@ function viewPayroll() {
     <div class="card kpi"><div class="k">Bonus paid out</div><div class="v num">${tot.base ? pct(tot.bonus / tot.base * 100) : "—"}</div><div class="d">of base (normal good = ${normPct}%)</div>${tot.base ? `<div class="meter" aria-hidden="true"><span class="fill" style="width:${clampPct(tot.bonus / tot.base * 100 / maxPct * 100)}%"></span><i class="mark" style="left:${clampPct(normPct / maxPct * 100)}%"></i></div>` : ""}</div>
   </div>
   <div class="card tablewrap">
+  <div class="panel-h"><h3>Pay by employee</h3><span class="tag">${rs.length}</span><span class="spacer"></span><span class="small muted">Click a row for the full payslip</span></div>
   <table>
     <thead><tr><th>Employee</th><th class="n">Score</th><th class="c">Bonus %</th><th class="n hide-sm">Hours</th><th class="c hide-sm">Gate</th><th class="c hide-sm">Ethics</th><th class="n hide-sm">Base</th><th class="n hide-sm">Bonus</th><th class="n hide-sm">Extra</th><th class="n">Total</th><th class="n hide-sm">vs current</th></tr></thead>
     <tbody>${rs.map((r) => `
@@ -397,7 +416,7 @@ function viewPayroll() {
       </tr>`).join("")}</tbody>
     <tfoot><tr><td>Total</td><td></td><td></td><td class="hide-sm"></td><td class="hide-sm"></td><td class="hide-sm"></td><td class="n hide-sm">${amd(tot.base)}</td><td class="n hide-sm">${amd(tot.bonus)}</td><td class="n hide-sm">${amd(tot.extra)}</td><td class="n">${amd(tot.total)}</td><td class="n hide-sm ${tot.total - tot.cur >= 0 ? "pos" : "neg"}">${tot.total - tot.cur >= 0 ? "+" : "−"}${amd(Math.abs(tot.total - tot.cur))}</td></tr></tfoot>
   </table></div>
-  <p class="small muted">Click a row for the full payslip. Amounts in AMD. “vs current” compares the new total with today's salary for the same days.</p>`;
+  <p class="small muted">Amounts in AMD. “vs current” compares the new total with today's salary for the same days.</p>`;
 }
 function finalDiffers(final, rs) {
   if (!final || !final.rows) return false;
@@ -506,8 +525,7 @@ function viewTasks() {
   const rs = results();
   const f = S.filter;
   const list = rs.filter((r) => !f || r.memberId === f);
-  html += `<div class="row section"><h3 style="margin:0">Scored tasks · ${esc(monthName(S.month))}</h3><span class="spacer"></span><select data-action="filter" data-live="0"><option value="">Everyone</option>${rs.map((r) => `<option value="${esc(r.memberId)}" ${f === r.memberId ? "selected" : ""}>${esc(r.name)}</option>`).join("")}</select></div>`;
-  html += `<div class="card tablewrap" style="margin-top:10px"><table><thead><tr><th>Task</th><th class="hide-sm">Assignee</th><th>Priority</th><th class="n">Due</th><th class="n">Submitted</th><th class="c">Late</th><th class="c">Rej.</th><th class="c">Timing</th><th class="c">Quality</th><th class="c">Score</th></tr></thead><tbody>`;
+  html += `<div class="card tablewrap section"><div class="panel-h"><h3>Scored tasks · ${esc(monthName(S.month))}</h3><span class="spacer"></span><select data-action="filter" data-live="0" aria-label="Show tasks for"><option value="">Everyone</option>${rs.map((r) => `<option value="${esc(r.memberId)}" ${f === r.memberId ? "selected" : ""}>${esc(r.name)}</option>`).join("")}</select></div><table><thead><tr><th>Task</th><th class="hide-sm">Assignee</th><th>Priority</th><th class="n">Due</th><th class="n">Submitted</th><th class="c">Late</th><th class="c">Rej.</th><th class="c">Timing</th><th class="c">Quality</th><th class="c">Score</th></tr></thead><tbody>`;
   let n = 0;
   for (const r of list) for (const t of r.tasks) { n++; html += `<tr><td><b>${esc(t.key)}</b> <span class="muted">${esc(t.summary)}</span></td><td class="hide-sm">${esc(r.name)}</td><td>${prio(t.priority)}</td><td class="n">${fmtDate(t.due)}</td><td class="n">${fmtDate(t.submittedOn)}${!t.submitted && t.resolved ? `<span class="muted small" title="No Submitted date; Resolved date used"> *</span>` : ""}</td><td class="c">${t.late == null ? `<span class="muted small">no due</span>` : t.late > 0 ? `<span class="late">${t.late}</span>` : t.late}</td><td class="c">${t.rejections || 0}${t.reopened ? `<div class="small muted">reopened</div>` : ""}</td><td class="c">${t.timing == null ? "—" : t.timing}</td><td class="c">${t.quality}</td><td class="c"><b class="sc ${scCls(t.score)}">${+t.score.toFixed(1)}</b></td></tr>`; }
   if (!n) html += `<tr><td colspan="10" class="empty">No tasks resolved in ${esc(monthName(S.month))} for the team.</td></tr>`;
@@ -552,7 +570,7 @@ function viewHours() {
       <div class="row" style="margin-top:10px"><button class="btn primary" data-action="hours-apply" ${rows.some((x) => x.m) ? "" : "disabled"}>Apply ${rows.filter((x) => x.m).length} matched</button><button class="btn ghost" data-action="hours-cancel">Cancel</button></div></div>`;
     }
   }
-  html += `<div class="card tablewrap section"><table><thead><tr><th>Employee</th><th class="n">Worked hours</th><th class="n">Leave days</th><th class="n">Sick days</th><th class="n">Unpaid days</th><th class="n">Required</th><th class="c">Result</th></tr></thead><tbody>`;
+  html += `<div class="card tablewrap section"><div class="panel-h"><h3>Hours by employee</h3><span class="tag">${team.length}</span><span class="spacer"></span><span class="small muted">Saved as you go</span></div><table><thead><tr><th>Employee</th><th class="n">Worked hours</th><th class="n">Leave days</th><th class="n">Sick days</th><th class="n">Unpaid days</th><th class="n">Required</th><th class="c">Result</th></tr></thead><tbody>`;
   for (const m of team) {
     const h = hoursFor(m.id) || {};
     const r = E.computePerson(m, S.month, { tasks: [], hours: h.worked === "" || h.worked == null ? undefined : h, incidents: [] }, c);
@@ -583,7 +601,7 @@ function viewIncidents() {
     <label class="check" style="font-size:13px"><input type="checkbox" name="aiSlop"> AI slop</label>
     <button class="btn primary" type="submit">Log incident</button>
   </form>
-  <div class="card tablewrap section">${S.incidents.length ? `<table><thead><tr><th>Date</th><th>Employee</th><th>Level</th><th>What happened</th><th></th></tr></thead><tbody>${S.incidents.map((i) => `<tr><td class="num">${fmtDate(i.date)}</td><td><div class="who">${avatar(name(i.memberId))}<span>${esc(name(i.memberId))}</span></div></td><td><span class="tag ${i.level === "minor" ? "warn" : "bad"}">${esc(i.level)}</span>${i.aiSlop ? ` <span class="tag">AI slop</span>` : ""}</td><td>${esc(i.note)}</td><td class="n"><button class="btn ghost danger" data-action="incident-del" data-id="${esc(i.id)}">Delete</button></td></tr>`).join("")}</tbody></table>` : `<div class="empty">No incidents this month.</div>`}</div>
+  <div class="card tablewrap section"><div class="panel-h"><h3>Logged this month</h3><span class="tag">${S.incidents.length}</span></div>${S.incidents.length ? `<table><thead><tr><th>Date</th><th>Employee</th><th>Level</th><th>What happened</th><th></th></tr></thead><tbody>${S.incidents.map((i) => `<tr><td class="num">${fmtDate(i.date)}</td><td><div class="who">${avatar(name(i.memberId))}<span>${esc(name(i.memberId))}</span></div></td><td><span class="tag ${i.level === "minor" ? "warn" : "bad"}">${esc(i.level)}</span>${i.aiSlop ? ` <span class="tag">AI slop</span>` : ""}</td><td>${esc(i.note)}</td><td class="n"><button class="btn ghost danger" data-action="incident-del" data-id="${esc(i.id)}">Delete</button></td></tr>`).join("")}</tbody></table>` : `<div class="empty">No incidents this month.</div>`}</div>
   <p class="small muted">A second AI slop within 3 months is critical: log it as Critical.</p>`;
 }
 
@@ -605,7 +623,7 @@ function viewTeam() {
     <label class="f">End date<input type="date" name="end" value="${esc(m.end || "")}"></label>
     <div class="row"><button class="btn primary" type="submit">${edit ? "Save changes" : "Add employee"}</button>${edit ? `<button class="btn ghost" type="button" data-action="member-cancel">Cancel</button>` : ""}</div>
   </form>
-  <div class="card tablewrap section">${list.length ? `<table><thead><tr><th>Name</th><th class="hide-sm">Jira name</th><th class="hide-sm">Role</th><th class="n">Current salary</th><th class="n">Base (${c.basePct}%)</th><th class="n hide-sm">Normal month</th><th></th></tr></thead><tbody>${list.map((x) => {
+  <div class="card tablewrap section"><div class="panel-h"><h3>Employees</h3><span class="tag">${list.length}</span></div>${list.length ? `<table><thead><tr><th>Name</th><th class="hide-sm">Jira name</th><th class="hide-sm">Role</th><th class="n">Current salary</th><th class="n">Base (${c.basePct}%)</th><th class="n hide-sm">Normal month</th><th></th></tr></thead><tbody>${list.map((x) => {
     const base = Math.round((Number(x.salary) || 0) * c.basePct / 100);
     return `<tr${x.active === false ? ` style="opacity:.55"` : ""}><td><div class="who">${avatar(x.name)}<div><b>${esc(x.name)}</b>${x.end ? `<div class="small muted">until ${fmtDate(x.end)}</div>` : ""}</div></div></td><td class="hide-sm">${esc(x.jiraName || x.name)}</td><td class="hide-sm">${esc(x.role || "")}</td><td class="n">${Number(x.salary) > 0 ? amd(x.salary) : `<span class="tag warn">missing</span>`}</td><td class="n">${amd(base)}</td><td class="n hide-sm">${amd(base * (1 + (c.defaultBonusPct || 35) / 100))}</td><td class="n" style="white-space:nowrap"><button class="btn ghost" data-action="member-edit" data-id="${esc(x.id)}">Edit</button><button class="btn ghost" data-action="member-toggle" data-id="${esc(x.id)}">${x.active === false ? "Activate" : "Deactivate"}</button></td></tr>`;
   }).join("")}</tbody></table>` : `<div class="empty">No employees yet.</div>`}</div>`;
