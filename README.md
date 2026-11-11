@@ -14,7 +14,7 @@ The full rules are in [`docs/SPEC.md`](docs/SPEC.md). If the spec and `engine.js
 
 | File | What it is |
 |---|---|
-| `index.html` | The page: layout and styles (same look as the Glana Pay Calculator artifact). |
+| `index.html` | The page: layout and styles (sidebar navigation, top bar with the pay month, payslip side panel; icon rail on tablets, bottom bar on phones). |
 | `engine.js` | All the pay math. Pure functions, no DOM. Runs in the browser, the server and the tests. |
 | `app.js` | The app: tabs, payslip, Jira pull and CSV import, hours import, incidents, team, settings, storage. |
 | `server.js` | Small Node server: serves the site behind a password, reads Jira with an API token, stores the shared data. No packages needed. |
