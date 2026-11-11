@@ -14,7 +14,10 @@ let pass = 0, fail = 0;
 async function t(name, fn) { try { await fn(); pass++; } catch (e) { fail++; console.log("FAIL:", name, "\n   ", e.message); } }
 
 const listen = (srv) => new Promise((r) => srv.listen(0, "127.0.0.1", () => r(`http://127.0.0.1:${srv.address().port}`)));
-const basic = (u, p) => "Basic " + Buffer.from(`${u}:${p}`).toString("base64");
+/** Post the sign-in form like a browser does (without following the redirect). */
+const signIn = (base, password, headers) => fetch(base + "/login", { method: "POST", redirect: "manual", headers: Object.assign({ "content-type": "application/x-www-form-urlencoded" }, headers || {}), body: new URLSearchParams({ username: "glana", password }).toString() });
+const cookieOf = (r) => (r.headers.get("set-cookie") || "").split(";")[0];
+const get = (url, headers) => fetch(url, { redirect: "manual", headers: headers || {} });
 
 (async () => {
   // ---------- query building (the browser never sends JQL) ----------
@@ -41,16 +44,81 @@ const basic = (u, p) => "Basic " + Buffer.from(`${u}:${p}`).toString("base64");
   const jira = await startFakeJira();
   const cfg = configFromEnv({ JIRA_BASE_URL: jira.url, JIRA_EMAIL: "bot@example.com", JIRA_API_TOKEN: "secret-token", APP_PASSWORD: "pw-123", JIRA_SITE: "glana.atlassian.net" });
   const srv = createServer(cfg); const base = await listen(srv);
-  const AUTH = { authorization: basic("glana", "pw-123") };
+  const AUTH = { cookie: cookieOf(await signIn(base, "pw-123")) }; // the cookie is signed with the password, so it works on every test server with "pw-123"
   const search = (body, headers) => fetch(base + "/api/jira/search", { method: "POST", headers: Object.assign({ "content-type": "application/json" }, AUTH, headers || {}), body: JSON.stringify(body) });
 
-  await t("password protects every page", async () => {
-    for (const p of ["/", "/app.js", "/api/status"]) {
-      const r = await fetch(base + p); assert.strictEqual(r.status, 401, p);
-      assert.match(r.headers.get("www-authenticate"), /Basic/);
+  await t("not signed in: pages go to /login, the API answers 401 JSON, no browser popup", async () => {
+    for (const p of ["/", "/index.html", "/app.js", "/engine.js", "/server.js", "/anything"]) {
+      const r = await get(base + p); assert.strictEqual(r.status, 303, p); assert.strictEqual(r.headers.get("location"), "/login", p);
+      assert.strictEqual(await r.text(), "", p);
     }
-    assert.strictEqual((await fetch(base + "/", { headers: { authorization: basic("glana", "wrong") } })).status, 401);
-    assert.strictEqual((await fetch(base + "/", { headers: AUTH })).status, 200);
+    for (const p of ["/api/status", "/api/db", "/api/jira/search"]) {
+      const r = await get(base + p); assert.strictEqual(r.status, 401, p);
+      assert.strictEqual(r.headers.get("www-authenticate"), null);
+      assert.strictEqual((await r.json()).code, "login_required");
+    }
+    // the old Basic header no longer opens anything
+    assert.strictEqual((await get(base + "/", { authorization: "Basic " + Buffer.from("glana:pw-123").toString("base64") })).status, 303);
+  });
+  await t("the sign-in page is shown before sign-in and has nothing of the app in it", async () => {
+    const r = await get(base + "/login"); assert.strictEqual(r.status, 200);
+    assert.match(r.headers.get("content-type"), /text\/html/);
+    const html = await r.text();
+    assert.match(html, /<form method="post" action="\/login"/); assert.match(html, /type="password"/); assert.match(html, /Sign in/);
+    assert.ok(!/app\.js|engine\.js|loginError/.test(html));
+  });
+  await t("wrong password: 401, a clear message, no cookie", async () => {
+    const r = await signIn(base, "wrong"); assert.strictEqual(r.status, 401);
+    assert.strictEqual(r.headers.get("set-cookie"), null);
+    assert.match(await r.text(), /id="loginError"[^>]*>Wrong password\. Please try again\./);
+    assert.strictEqual((await signIn(base, "")).status, 401);
+  });
+  await t("right password: cookie for 7 days (HttpOnly, SameSite=Lax), then the app opens", async () => {
+    const r = await signIn(base, "pw-123"); assert.strictEqual(r.status, 303); assert.strictEqual(r.headers.get("location"), "/");
+    const c = r.headers.get("set-cookie");
+    assert.match(c, /^glana_session=v1\.\d+\.[\w-]{43}; Path=\/; Max-Age=604800; HttpOnly; SameSite=Lax$/);
+    assert.ok(!c.includes("pw-123"));
+    const home = await get(base + "/", AUTH); assert.strictEqual(home.status, 200); assert.match(await home.text(), /<title>Glana Pay<\/title>/);
+    assert.strictEqual((await get(base + "/app.js", AUTH)).status, 200);
+    assert.strictEqual((await get(base + "/login", AUTH)).headers.get("location"), "/"); // already signed in
+    const viaJson = await fetch(base + "/login", { method: "POST", redirect: "manual", headers: { "content-type": "application/json" }, body: JSON.stringify({ password: "pw-123" }) });
+    assert.strictEqual(viaJson.status, 303);
+  });
+  await t("the cookie is marked Secure on Vercel and behind HTTPS", async () => {
+    const s = createServer(configFromEnv({ VERCEL: "1", APP_PASSWORD: "pw-123" })); const b = await listen(s);
+    assert.match((await signIn(b, "pw-123")).headers.get("set-cookie"), /; HttpOnly; SameSite=Lax; Secure$/);
+    s.close();
+    assert.match((await signIn(base, "pw-123", { "x-forwarded-proto": "https" })).headers.get("set-cookie"), /; Secure$/);
+  });
+  await t("forged, changed and expired cookies are refused", async () => {
+    const [, exp, sig] = AUTH.cookie.split("=")[1].split(".");
+    const realNow = Date.now;
+    const bad = [
+      "glana_session=", "glana_session=v1", `glana_session=v1.${Number(exp) + 1000}.${sig}`, `glana_session=v1.${exp}.${"A".repeat(43)}`,
+      `glana_session=v1.${exp}.${sig}x`, `glana_session=v2.${exp}.${sig}`, `other=v1.${exp}.${sig}`,
+    ];
+    for (const c of bad) assert.strictEqual((await get(base + "/api/status", { cookie: c })).status, 401, c);
+    assert.strictEqual((await get(base + "/api/status", { cookie: "a=b; " + AUTH.cookie + "; c=d" })).status, 200);
+    try {
+      Date.now = () => realNow() + 7 * 86400000 - 60000; assert.strictEqual((await get(base + "/api/status", AUTH)).status, 200);
+      Date.now = () => realNow() + 7 * 86400000 + 60000; assert.strictEqual((await get(base + "/api/status", AUTH)).status, 401);
+    } finally { Date.now = realNow; }
+  });
+  await t("changing APP_PASSWORD (or SESSION_SECRET) signs everyone out", async () => {
+    for (const env of [{ APP_PASSWORD: "new-pw" }, { APP_PASSWORD: "pw-123", SESSION_SECRET: "extra" }]) {
+      const s = createServer(configFromEnv(env)); const b = await listen(s);
+      assert.strictEqual((await get(b + "/api/status", AUTH)).status, 401);
+      assert.strictEqual((await get(b + "/", AUTH)).headers.get("location"), "/login");
+      const fresh = { cookie: cookieOf(await signIn(b, env.APP_PASSWORD)) };
+      assert.strictEqual((await get(b + "/api/status", fresh)).status, 200);
+      s.close();
+    }
+  });
+  await t("log out clears the cookie", async () => {
+    const r = await fetch(base + "/logout", { method: "POST", redirect: "manual", headers: AUTH });
+    assert.strictEqual(r.status, 303); assert.strictEqual(r.headers.get("location"), "/login");
+    assert.match(r.headers.get("set-cookie"), /^glana_session=; Path=\/; Max-Age=0; HttpOnly; SameSite=Lax$/);
+    assert.strictEqual((await get(base + "/logout", AUTH)).headers.get("set-cookie"), null); // a plain link can't log you out
   });
   await t("only the app files are served", async () => {
     for (const p of ["/server.js", "/.env", "/package.json", "/tests/fake_jira.js", "/../server.js", "/docs/SPEC.md"]) assert.strictEqual((await fetch(base + p, { headers: AUTH })).status, 404, p);
@@ -59,7 +127,7 @@ const basic = (u, p) => "Basic " + Buffer.from(`${u}:${p}`).toString("base64");
     assert.strictEqual(r.headers.get("x-frame-options"), "DENY");
   });
   await t("status says Jira is connected", async () => {
-    assert.deepStrictEqual(await (await fetch(base + "/api/status", { headers: AUTH })).json(), { ok: true, jira: true, site: "glana.atlassian.net", db: null, hosted: false });
+    assert.deepStrictEqual(await (await fetch(base + "/api/status", { headers: AUTH })).json(), { ok: true, jira: true, site: "glana.atlassian.net", db: null, hosted: false, auth: true });
   });
 
   let pulled = [];
@@ -119,13 +187,33 @@ const basic = (u, p) => "Basic " + Buffer.from(`${u}:${p}`).toString("base64");
   });
   await t("10 wrong passwords → locked out for a while", async () => {
     const s = createServer(cfg); const b = await listen(s);
-    for (let i = 0; i < 10; i++) assert.strictEqual((await fetch(b + "/", { headers: { authorization: basic("glana", "guess" + i) } })).status, 401);
-    assert.strictEqual((await fetch(b + "/", { headers: AUTH })).status, 429);
+    for (let i = 0; i < 10; i++) assert.strictEqual((await signIn(b, "guess" + i)).status, 401);
+    const r = await signIn(b, "pw-123"); // even the right password has to wait now
+    assert.strictEqual(r.status, 429); assert.strictEqual(r.headers.get("set-cookie"), null);
+    assert.match(await r.text(), /Too many wrong passwords\. Try again in 15 minutes\./);
+    assert.strictEqual((await get(b + "/api/status", AUTH)).status, 200); // someone already signed in keeps working
+    const realNow = Date.now;
+    try { Date.now = () => realNow() + 15 * 60000 + 1000; assert.strictEqual((await signIn(b, "pw-123")).status, 303); } finally { Date.now = realNow; }
+    s.close();
+  });
+  await t("a right password resets the wrong-password count", async () => {
+    const s = createServer(cfg); const b = await listen(s);
+    for (let round = 0; round < 2; round++) {
+      for (let i = 0; i < 9; i++) assert.strictEqual((await signIn(b, "guess" + i)).status, 401);
+      assert.strictEqual((await signIn(b, "pw-123")).status, 303);
+    }
+    s.close();
+  });
+  await t("no password (this computer only): no sign-in, /login goes to the app", async () => {
+    const s = createServer(configFromEnv({})); const b = await listen(s);
+    assert.strictEqual((await get(b + "/")).status, 200);
+    assert.strictEqual((await (await get(b + "/api/status")).json()).auth, false);
+    assert.strictEqual((await get(b + "/login")).headers.get("location"), "/");
     s.close();
   });
   await t("on Vercel without a password: everything stays locked", async () => {
     const s2 = createServer(configFromEnv({ VERCEL: "1", JIRA_EMAIL: "a", JIRA_API_TOKEN: "b" }), { store: DB.MemoryStore({ "team/a": { salary: 1 } }) }); const b2 = await listen(s2);
-    for (const p of ["/", "/api/db", "/api/status", "/app.js"]) { const r = await fetch(b2 + p); assert.strictEqual(r.status, 503, p); assert.match(await r.text(), /APP_PASSWORD/); }
+    for (const p of ["/", "/login", "/api/db", "/api/status", "/app.js"]) { const r = await fetch(b2 + p); assert.strictEqual(r.status, 503, p); assert.match(await r.text(), /APP_PASSWORD/); }
     s2.close();
   });
   await t("refuses to go online without a password", () => {
@@ -163,6 +251,7 @@ const basic = (u, p) => "Basic " + Buffer.from(`${u}:${p}`).toString("base64");
     });
     await t(`${label}: password needed`, async () => {
       assert.strictEqual((await fetch(b + "/api/db")).status, 401);
+      assert.strictEqual((await fetch(b + "/api/db", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ ops: [{ op: "set", path: "team/x", data: { name: "X" } }] }) })).status, 401);
     });
     s.close();
   }

@@ -7,8 +7,9 @@
  * Settings come from environment variables (or a .env file next to this one, see .env.example):
  *   JIRA_EMAIL, JIRA_API_TOKEN   Atlassian account e-mail + API token (read access to the projects)
  *   JIRA_SITE                    default glana.atlassian.net
- *   APP_PASSWORD                 password for the website (user name APP_USER, default "glana").
+ *   APP_PASSWORD                 password for the website's sign-in page (/login).
  *                                Required unless the server only listens on this computer.
+ *   SESSION_SECRET               optional extra secret for signing the sign-in cookie (see "sign-in" below)
  *   PORT, HOST                   default 8080; 127.0.0.1 without a password, 0.0.0.0 with one
  *   KV_REST_API_URL / _TOKEN     shared database (Upstash Redis, added by Vercel). Without it, a normal
  *                                computer saves to data/db.json; on Vercel the app falls back to the browser.
@@ -23,7 +24,8 @@ const E = require("./engine.js");
 const DB = require("./store.js");
 
 const ROOT = __dirname;
-/** Only these files are served. Everything else (server.js, .env, tests…) is never sent. */
+/** Only these files are served, and only after sign-in. Everything else (server.js, .env, tests…) is never sent.
+ *  login.html is the one page shown before sign-in (at /login). */
 const FILES = { "/": "index.html", "/index.html": "index.html", "/engine.js": "engine.js", "/app.js": "app.js" };
 const TYPES = { ".html": "text/html; charset=utf-8", ".js": "text/javascript; charset=utf-8" };
 const SECURITY_HEADERS = {
@@ -32,6 +34,10 @@ const SECURITY_HEADERS = {
   "Referrer-Policy": "no-referrer",
   "Cache-Control": "no-store",
 };
+const COOKIE = "glana_session";
+const SESSION_DAYS = 7;
+const SESSION_MS = SESSION_DAYS * 86400000;
+const MAX_FAILS = 10, LOCK_MS = 15 * 60000;
 const ISO_DAY = /^\d{4}-\d{2}-\d{2}$/;
 const PROJECT_KEY = /^[A-Z][A-Z0-9_]{0,19}$/;
 const ISSUE_TYPE = /^[A-Za-z0-9][A-Za-z0-9 _-]{0,39}$/;
@@ -55,8 +61,9 @@ function configFromEnv(env) {
     jiraBase: (env.JIRA_BASE_URL || `https://${site}`).replace(/\/+$/, ""), // override only for tests
     jiraEmail: env.JIRA_EMAIL || "",
     jiraToken: env.JIRA_API_TOKEN || "",
-    user: env.APP_USER || "glana",
+    user: env.APP_USER || "glana", // only pre-fills a hidden field so password managers can file the password under a name
     password,
+    sessionSecret: env.SESSION_SECRET || "",
     port: Number(env.PORT) || 8080,
     host: env.HOST || (password ? "0.0.0.0" : "127.0.0.1"),
     trustProxy: !!env.VERCEL, // behind Vercel the visitor's address is in X-Forwarded-For
@@ -86,15 +93,47 @@ function readBody(req, limit) {
   });
 }
 const sha = (s) => crypto.createHash("sha256").update(String(s)).digest();
-function checkPassword(req, cfg) {
-  const h = req.headers.authorization || "";
-  if (!h.startsWith("Basic ")) return false;
-  const raw = Buffer.from(h.slice(6), "base64").toString("utf8");
-  const i = raw.indexOf(":");
-  if (i < 0) return false;
-  const userOk = crypto.timingSafeEqual(sha(raw.slice(0, i)), sha(cfg.user));
-  const passOk = crypto.timingSafeEqual(sha(raw.slice(i + 1)), sha(cfg.password));
-  return userOk && passOk;
+
+// ---------- sign-in ----------
+// No sessions are kept on the server (Vercel starts a fresh copy of it whenever it likes). The cookie itself is the
+// proof: "v1.<expiry time>.<signature>", signed with a key made from APP_PASSWORD (+ SESSION_SECRET if set).
+// Nobody can forge or extend it without the key, and changing APP_PASSWORD makes every old cookie invalid.
+function passwordOk(given, cfg) {
+  return typeof given === "string" && crypto.timingSafeEqual(sha(given), sha(cfg.password));
+}
+const sessionKey = (cfg) => sha("glana-pay-session\n" + cfg.sessionSecret + "\n" + cfg.password);
+const sign = (cfg, exp) => crypto.createHmac("sha256", sessionKey(cfg)).update("v1." + exp).digest("base64url");
+function makeToken(cfg, now) { const exp = now + SESSION_MS; return `v1.${exp}.${sign(cfg, exp)}`; }
+function tokenOk(token, cfg, now) {
+  const m = /^v1\.(\d{1,16})\.([A-Za-z0-9_-]{43})$/.exec(token || "");
+  if (!m) return false;
+  const good = crypto.timingSafeEqual(Buffer.from(m[2]), Buffer.from(sign(cfg, Number(m[1]))));
+  return good && Number(m[1]) > now;
+}
+function readCookie(req, name) {
+  for (const part of String(req.headers.cookie || "").split(";")) {
+    const i = part.indexOf("=");
+    if (i > 0 && part.slice(0, i).trim() === name) return part.slice(i + 1).trim();
+  }
+  return "";
+}
+/** Secure is always set on Vercel / behind HTTPS. Only plain http (npm start on your own computer) leaves it out,
+ *  because browsers would otherwise never send the cookie back there. */
+function cookieHeader(req, cfg, value, maxAgeSec) {
+  const https = cfg.hosted || !!(req.socket && req.socket.encrypted) || String(req.headers["x-forwarded-proto"] || "").split(",")[0].trim() === "https";
+  return `${COOKIE}=${value}; Path=/; Max-Age=${maxAgeSec}; HttpOnly; SameSite=Lax${https ? "; Secure" : ""}`;
+}
+const escHtml = (t) => String(t).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+function loginPage(cfg, error) {
+  return fs.readFileSync(path.join(ROOT, "login.html"), "utf8")
+    .replace("<!--ERROR-->", error ? `<p class="err" id="loginError" role="alert">${escHtml(error)}</p>` : "")
+    .replace("__USER__", escHtml(cfg.user));
+}
+/** The password from the sign-in form (a normal form post; JSON is accepted too). */
+async function readPassword(req) {
+  const text = await readBody(req, 4096);
+  if (text.trimStart().startsWith("{")) { const o = JSON.parse(text); return o && typeof o.password === "string" ? o.password : ""; }
+  return new URLSearchParams(text).get("password") || "";
 }
 
 // ---------- Jira ----------
@@ -221,17 +260,40 @@ function createHandler(cfg, opts) {
       if (cfg.hosted && !cfg.password) {
         return send(res, 503, "This site is locked until APP_PASSWORD is set (Vercel: Settings → Environment Variables), then redeploy.", { "Content-Type": "text/plain; charset=utf-8" });
       }
-      if (cfg.password) {
-        const now = Date.now(); const recent = (fails.get(ip) || []).filter((t) => now - t < 15 * 60000);
-        if (recent.length >= 10) return send(res, 429, "Too many wrong passwords. Try again in 15 minutes.", { "Content-Type": "text/plain; charset=utf-8" });
-        if (!checkPassword(req, cfg)) {
-          if (req.headers.authorization) { recent.push(now); fails.set(ip, recent); }
-          return send(res, 401, "Password required.", { "Content-Type": "text/plain; charset=utf-8", "WWW-Authenticate": 'Basic realm="Glana Pay", charset="UTF-8"' });
+      const isApi = url.pathname.startsWith("/api/");
+      const html = { "Content-Type": "text/html; charset=utf-8" };
+      if (!cfg.password) {
+        // Only possible on this computer (see the bottom of this file): no sign-in, so no sign-in page either.
+        if (url.pathname === "/login" || url.pathname === "/logout") return send(res, 303, "", { Location: "/" });
+      } else {
+        const now = Date.now();
+        const signedIn = tokenOk(readCookie(req, COOKIE), cfg, now);
+        if (url.pathname === "/logout") {
+          if (req.method !== "POST") return send(res, 303, "", { Location: signedIn ? "/" : "/login" });
+          return send(res, 303, "", { Location: "/login", "Set-Cookie": cookieHeader(req, cfg, "", 0) });
         }
-        fails.delete(ip);
+        if (url.pathname === "/login") {
+          if (req.method === "GET") return signedIn ? send(res, 303, "", { Location: "/" }) : send(res, 200, loginPage(cfg, ""), html);
+          if (req.method !== "POST") return send(res, 405, "Not allowed.", { "Content-Type": "text/plain; charset=utf-8" });
+          const recent = (fails.get(ip) || []).filter((t) => now - t < LOCK_MS);
+          if (recent.length >= MAX_FAILS) return send(res, 429, loginPage(cfg, "Too many wrong passwords. Try again in 15 minutes."), html);
+          let given = "";
+          try { given = await readPassword(req); } catch (e) { return send(res, 400, loginPage(cfg, "That didn't work. Please try again."), html); }
+          if (!passwordOk(given, cfg)) {
+            recent.push(now); fails.set(ip, recent);
+            const left = MAX_FAILS - recent.length;
+            return send(res, 401, loginPage(cfg, left > 0 ? "Wrong password. Please try again." : "Too many wrong passwords. Try again in 15 minutes."), html);
+          }
+          fails.delete(ip);
+          return send(res, 303, "", { Location: "/", "Set-Cookie": cookieHeader(req, cfg, makeToken(cfg, now), SESSION_MS / 1000) });
+        }
+        if (!signedIn) {
+          if (isApi) return send(res, 401, { code: "login_required", message: "Sign in first." });
+          return send(res, 303, "", { Location: "/login" });
+        }
       }
       if (req.method === "GET" && url.pathname === "/api/status") {
-        return send(res, 200, { ok: true, jira: !!(cfg.jiraEmail && cfg.jiraToken), site: cfg.jiraSite, db: store ? store.kind : null, hosted: !!cfg.hosted });
+        return send(res, 200, { ok: true, jira: !!(cfg.jiraEmail && cfg.jiraToken), site: cfg.jiraSite, db: store ? store.kind : null, hosted: !!cfg.hosted, auth: !!cfg.password });
       }
       if (url.pathname === "/api/db" || url.pathname === "/api/db/doc") return await handleDb(req, res, url, store);
       if (url.pathname === "/api/jira/search") {
@@ -269,7 +331,7 @@ if (require.main === module) {
   createServer(cfg, { store }).listen(cfg.port, cfg.host, () => {
     console.log(`Glana Pay running at http://${cfg.host === "0.0.0.0" ? "localhost" : cfg.host}:${cfg.port}`);
     console.log(cfg.jiraEmail && cfg.jiraToken ? `Jira: ${cfg.jiraSite} as ${cfg.jiraEmail}` : "Jira: not connected (set JIRA_EMAIL and JIRA_API_TOKEN). CSV upload still works.");
-    console.log(cfg.password ? `Website password: on (user "${cfg.user}")` : "Website password: off (only this computer can open it)");
+    console.log(cfg.password ? "Website password: on (sign-in page at /login)" : "Website password: off (only this computer can open it)");
     console.log(store ? `Shared data: ${store.kind === "file" ? "data/db.json" : store.kind}` : "Shared data: none");
   });
 }

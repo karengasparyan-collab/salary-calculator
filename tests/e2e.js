@@ -238,19 +238,48 @@ async function step(name, fn) {
   const app = createServer(configFromEnv({ JIRA_BASE_URL: jira.url, JIRA_EMAIL: "bot@example.com", JIRA_API_TOKEN: "secret-token", APP_PASSWORD: "pw-123" }), { store: shared });
   await new Promise((r) => app.listen(0, "127.0.0.1", r));
   const appUrl = `http://127.0.0.1:${app.address().port}/`;
-  await step("server: wrong password shows nothing", async () => {
-    const c = await browser.newContext({ httpCredentials: { username: "glana", password: "nope" } });
-    const p = await c.newPage(); const r = await p.goto(appUrl);
-    assert.strictEqual(r.status(), 401); await c.close();
-  });
-  const sctx = await browser.newContext({ viewport: { width: 1280, height: 900 }, httpCredentials: { username: "glana", password: "pw-123" } });
+  const signIn = async (p, password) => { await p.fill("#password", password); await p.click("#signIn"); };
+  const sctx = await browser.newContext({ viewport: { width: 1280, height: 900 } });
   sctx.setDefaultTimeout(8000);
   const sp = await sctx.newPage();
   sp.on("pageerror", (e) => errors.push(e.message));
+  await step("login: not signed in → the sign-in page, nothing of the app", async () => {
+    const r = await sp.goto(appUrl);
+    assert.strictEqual(new URL(sp.url()).pathname, "/login"); assert.strictEqual(r.status(), 200);
+    assert.strictEqual(await sp.title(), "Sign in · Glana Pay");
+    assert.strictEqual(await sp.locator("script[src]").count(), 0);
+    assert.strictEqual(await sp.locator("#loginError").count(), 0);
+    assert.strictEqual(await sp.evaluate(() => document.activeElement.id), "password");
+    assert.strictEqual(await sp.evaluate(() => fetch("/api/db").then((x) => x.status)), 401);
+    assert.strictEqual((await sp.goto(appUrl + "app.js")).url(), appUrl + "login");
+  });
+  await step("login: same look as the app, light and dark", async () => {
+    const look = () => sp.evaluate(() => { const c = getComputedStyle(document.body), b = getComputedStyle(document.querySelector("#signIn")); return [c.fontFamily.split(",")[0], c.color, b.backgroundColor]; });
+    assert.deepStrictEqual(await look(), ["Inter", "rgb(34, 20, 51)", "rgb(124, 58, 237)"]);
+    await sp.emulateMedia({ colorScheme: "dark" });
+    await sp.waitForTimeout(400); // the button's color fades over
+    assert.deepStrictEqual(await look(), ["Inter", "rgb(238, 232, 247)", "rgb(167, 139, 250)"]);
+    await sp.emulateMedia({ colorScheme: "light" });
+  });
+  await step("login: wrong password → a clear message, still locked", async () => {
+    await signIn(sp, "nope");
+    await sp.waitForSelector("#loginError");
+    assert.strictEqual((await sp.innerText("#loginError")).trim(), "Wrong password. Please try again.");
+    assert.strictEqual(new URL(sp.url()).pathname, "/login");
+    assert.deepStrictEqual(await sctx.cookies(), []);
+  });
+  await step("login: right password → the app, with an HttpOnly cookie for 7 days", async () => {
+    await signIn(sp, "pw-123");
+    await sp.waitForURL(appUrl);
+    const [c] = await sctx.cookies();
+    assert.strictEqual(c.name, "glana_session"); assert.strictEqual(c.httpOnly, true); assert.strictEqual(c.sameSite, "Lax");
+    assert.ok(Math.abs(c.expires - (Date.now() / 1000 + 7 * 86400)) < 60);
+    assert.strictEqual(await sp.evaluate(() => document.cookie), ""); // page scripts can't read it
+  });
   await step("server: Pull from Jira → 820,800", async () => {
-    await sp.goto(appUrl);
     await sp.waitForFunction(() => window.__glana && window.__glana.S.mode === "server");
-    assert.deepStrictEqual(await sp.evaluate(() => window.__glana.S.jiraServer), { ok: true, jira: true, site: "glana.atlassian.net", db: "memory", hosted: false });
+    assert.deepStrictEqual(await sp.evaluate(() => window.__glana.S.jiraServer), { ok: true, jira: true, site: "glana.atlassian.net", db: "memory", hosted: false, auth: true });
+    assert.ok(await sp.isVisible("#logoutForm button"));
     assert.match(await sp.innerText("#banners"), /shared with everyone who has the password/);
     await sp.click('nav.tabs [data-tab="team"]');
     await sp.fill('form[data-form="member"] [name=name]', "Ani");
@@ -303,12 +332,13 @@ async function step(name, fn) {
     assert.ok(docs["months/2026-11"].hours);
   });
   // second founder, separate browser profile
-  const bctx = await browser.newContext({ viewport: { width: 1280, height: 900 }, httpCredentials: { username: "glana", password: "pw-123" } });
+  const bctx = await browser.newContext({ viewport: { width: 1280, height: 900 } });
   bctx.setDefaultTimeout(8000);
   const bp = await bctx.newPage();
   bp.on("pageerror", (e) => errors.push(e.message));
   await step("shared: the other founder sees the same 820,800", async () => {
     await bp.goto(appUrl);
+    await signIn(bp, "pw-123");
     await bp.waitForFunction(() => window.__glana && window.__glana.S.mode === "server" && window.__glana.S.team.length === 1);
     for (let i = 0; i < 48 && (await bp.evaluate(() => window.__glana.S.month)) !== "2026-11"; i++) {
       const m = await bp.evaluate(() => window.__glana.S.month);
@@ -331,6 +361,25 @@ async function step(name, fn) {
     await sp.reload();
     await sp.waitForFunction(() => window.__glana && window.__glana.S.mode === "server" && window.__glana.S.team.length === 1);
     assert.strictEqual(await sp.evaluate(() => window.__glana.S.jiraServer.db), "memory");
+  });
+  await step("login: Log out → back to the sign-in page, the app is locked again", async () => {
+    await sp.click("#logoutForm button");
+    await sp.waitForURL(appUrl + "login");
+    assert.deepStrictEqual(await sctx.cookies(), []);
+    await sp.goto(appUrl); assert.strictEqual(new URL(sp.url()).pathname, "/login");
+    await sp.goBack(); assert.strictEqual(await sp.evaluate(() => fetch("/api/db").then((x) => x.status)), 401);
+    assert.strictEqual(await bp.evaluate(() => fetch("/api/status").then((x) => x.status)), 200); // the other founder stays signed in
+  });
+  await step("login: on a phone the Log out button is still there", async () => {
+    const phone = await browser.newContext({ viewport: { width: 390, height: 844 }, isMobile: true, hasTouch: true });
+    const pp = await phone.newPage(); pp.on("pageerror", (e) => errors.push(e.message));
+    await pp.goto(appUrl);
+    assert.ok(await pp.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth));
+    await signIn(pp, "pw-123");
+    await pp.waitForFunction(() => window.__glana && window.__glana.S.mode === "server");
+    assert.ok(await pp.isVisible("#logoutForm button"));
+    assert.ok(await pp.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth));
+    await phone.close();
   });
   await bctx.close();
   await sctx.close(); app.close(); jira.close();
