@@ -3,7 +3,11 @@
  *
  *   FileStore   one JSON file on this computer (npm start)
  *   RedisStore  Upstash Redis over its REST API (Vercel: Storage → Upstash for Redis). No packages needed.
- *   MemoryStore for tests */
+ *   MemoryStore for tests
+ *
+ * Each store also keeps one sign-in record (getAuth / putAuth: the hashed website password set in Settings).
+ * It lives outside the documents on purpose: /api/db never returns it, backups don't contain it,
+ * and "Restore from backup" (replaceAll) leaves it alone. */
 "use strict";
 const fs = require("fs");
 const path = require("path");
@@ -43,9 +47,11 @@ function checkAll(docs) {
 
 // ---------- in memory (tests) ----------
 function MemoryStore(initial) {
-  let docs = new Map(Object.entries(initial || {})); let rev = 0;
+  let docs = new Map(Object.entries(initial || {})); let rev = 0; let auth = null;
   return {
     kind: "memory",
+    async getAuth() { return auth ? clone(auth) : null; },
+    async putAuth(a) { auth = clone(a); },
     async all() { return { docs: Object.fromEntries([...docs].map(([k, v]) => [k, clone(v)])), rev }; },
     async rev() { return rev; },
     async get(p) { return docs.has(p) ? clone(docs.get(p)) : null; },
@@ -58,26 +64,28 @@ function MemoryStore(initial) {
 // ---------- one JSON file ----------
 function FileStore(file) {
   fs.mkdirSync(path.dirname(file), { recursive: true });
-  const read = () => { try { const d = JSON.parse(fs.readFileSync(file, "utf8")); return { docs: d.docs || {}, rev: d.rev || 0 }; } catch (e) { return { docs: {}, rev: 0 }; } };
+  const read = () => { try { const d = JSON.parse(fs.readFileSync(file, "utf8")); return { docs: d.docs || {}, rev: d.rev || 0, auth: d.auth || null }; } catch (e) { return { docs: {}, rev: 0, auth: null }; } };
   let state = read();
   let queue = Promise.resolve();
   const save = () => { const tmp = file + ".tmp"; fs.writeFileSync(tmp, JSON.stringify(state)); fs.renameSync(tmp, file); };
   const serial = (fn) => (queue = queue.then(fn, fn));
   return {
     kind: "file",
+    async getAuth() { return state.auth ? clone(state.auth) : null; },
+    putAuth: (a) => serial(() => { state.auth = clone(a); save(); }),
     async all() { return { docs: clone(state.docs), rev: state.rev }; },
     async rev() { return state.rev; },
     async get(p) { return state.docs[p] ? clone(state.docs[p]) : null; },
     put: (p, d) => serial(() => { state.docs[p] = clone(d); state.rev++; save(); }),
     del: (p) => serial(() => { delete state.docs[p]; state.rev++; save(); }),
-    replaceAll: (all) => serial(() => { state = { docs: clone(all), rev: state.rev + 1 }; save(); }),
+    replaceAll: (all) => serial(() => { state = { docs: clone(all), rev: state.rev + 1, auth: state.auth }; save(); }),
   };
 }
 
 // ---------- Upstash Redis (REST) ----------
 function RedisStore(url, token, prefix, fetchImpl) {
   const base = String(url).replace(/\/+$/, "");
-  const H = (prefix || "glanapay") + ":docs", REV = (prefix || "glanapay") + ":rev";
+  const H = (prefix || "glanapay") + ":docs", REV = (prefix || "glanapay") + ":rev", AUTH = (prefix || "glanapay") + ":auth";
   const f = fetchImpl || globalThis.fetch;
   async function call(pathPart, body) {
     let r;
@@ -91,6 +99,8 @@ function RedisStore(url, token, prefix, fetchImpl) {
   const tx = async (cmds) => { const d = await call("/multi-exec", cmds); const bad = Array.isArray(d) && d.find((x) => x && x.error); if (bad) throw { status: 503, code: "unavailable", message: bad.error }; return d; };
   return {
     kind: "redis",
+    async getAuth() { const v = await cmd("GET", AUTH); return v == null ? null : JSON.parse(v); },
+    async putAuth(a) { await cmd("SET", AUTH, JSON.stringify(a)); },
     async all() {
       const d = await call("/pipeline", [["HGETALL", H], ["GET", REV]]);
       const flat = (d[0] && d[0].result) || [];

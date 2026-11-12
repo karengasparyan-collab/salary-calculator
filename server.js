@@ -9,6 +9,7 @@
  *   JIRA_SITE                    default glana.atlassian.net
  *   APP_PASSWORD                 password for the website's sign-in page (/login).
  *                                Required unless the server only listens on this computer.
+ *                                Can be replaced from Settings → Password (needs the shared database).
  *   SESSION_SECRET               optional extra secret for signing the sign-in cookie (see "sign-in" below)
  *   PORT, HOST                   default 8080; 127.0.0.1 without a password, 0.0.0.0 with one
  *   KV_REST_API_URL / _TOKEN     shared database (Upstash Redis, added by Vercel). Without it, a normal
@@ -96,18 +97,36 @@ const sha = (s) => crypto.createHash("sha256").update(String(s)).digest();
 
 // ---------- sign-in ----------
 // No sessions are kept on the server (Vercel starts a fresh copy of it whenever it likes). The cookie itself is the
-// proof: "v1.<expiry time>.<signature>", signed with a key made from APP_PASSWORD (+ SESSION_SECRET if set).
-// Nobody can forge or extend it without the key, and changing APP_PASSWORD makes every old cookie invalid.
-function passwordOk(given, cfg) {
-  return typeof given === "string" && crypto.timingSafeEqual(sha(given), sha(cfg.password));
+// proof: "v1.<expiry time>.<signature>", signed with a key made from the current password (+ SESSION_SECRET if set).
+// Nobody can forge or extend it without the key, and changing the password makes every old cookie invalid.
+//
+// The password is APP_PASSWORD, until someone changes it in Settings. Then the database keeps a record
+// { v, salt, hash, envTag, changedAt }: the new password hashed with scrypt (never the password itself).
+// envTag ties the record to the APP_PASSWORD it replaced: if APP_PASSWORD is changed in Vercel later, the record is
+// ignored and APP_PASSWORD works again. That is the way back in when nobody remembers the new password.
+const PW_MIN = 8, PW_MAX = 200;
+const envTag = (cfg) => crypto.createHmac("sha256", "glana-pay-env-tag").update(cfg.password).digest("hex");
+const scrypt = (pw, salt) => crypto.scryptSync(String(pw), Buffer.from(salt, "base64"), 32, { N: 16384, r: 8, p: 1 });
+function makeAuthRecord(cfg, pw, now) {
+  const salt = crypto.randomBytes(16).toString("base64");
+  return { v: 1, salt, hash: scrypt(pw, salt).toString("base64"), envTag: envTag(cfg), changedAt: new Date(now).toISOString() };
 }
-const sessionKey = (cfg) => sha("glana-pay-session\n" + cfg.sessionSecret + "\n" + cfg.password);
-const sign = (cfg, exp) => crypto.createHmac("sha256", sessionKey(cfg)).update("v1." + exp).digest("base64url");
-function makeToken(cfg, now) { const exp = now + SESSION_MS; return `v1.${exp}.${sign(cfg, exp)}`; }
-function tokenOk(token, cfg, now) {
+/** The stored record if it is in force (well-formed and made while today's APP_PASSWORD was set), else null. */
+function activeRecord(rec, cfg) {
+  return rec && rec.v === 1 && typeof rec.salt === "string" && typeof rec.hash === "string" && rec.envTag === envTag(cfg) ? rec : null;
+}
+function passwordOk(given, cfg, rec) {
+  if (typeof given !== "string") return false;
+  if (rec) { const want = Buffer.from(rec.hash, "base64"); return given.length <= PW_MAX && want.length === 32 && crypto.timingSafeEqual(scrypt(given, rec.salt), want); }
+  return crypto.timingSafeEqual(sha(given), sha(cfg.password));
+}
+const sessionKey = (cfg, rec) => sha("glana-pay-session\n" + cfg.sessionSecret + "\n" + cfg.password + (rec ? "\n" + rec.hash : ""));
+const sign = (key, exp) => crypto.createHmac("sha256", key).update("v1." + exp).digest("base64url");
+function makeToken(key, now) { const exp = now + SESSION_MS; return `v1.${exp}.${sign(key, exp)}`; }
+function tokenOk(token, key, now) {
   const m = /^v1\.(\d{1,16})\.([A-Za-z0-9_-]{43})$/.exec(token || "");
   if (!m) return false;
-  const good = crypto.timingSafeEqual(Buffer.from(m[2]), Buffer.from(sign(cfg, Number(m[1]))));
+  const good = crypto.timingSafeEqual(Buffer.from(m[2]), Buffer.from(sign(key, Number(m[1]))));
   return good && Number(m[1]) > now;
 }
 function readCookie(req, name) {
@@ -128,6 +147,16 @@ function loginPage(cfg, error) {
   return fs.readFileSync(path.join(ROOT, "login.html"), "utf8")
     .replace("<!--ERROR-->", error ? `<p class="err" id="loginError" role="alert">${escHtml(error)}</p>` : "")
     .replace("__USER__", escHtml(cfg.user));
+}
+/** Settings → Password: { current, next } as JSON. Returns { current, next } or { error }. */
+async function readPasswordChange(req) {
+  const o = JSON.parse(await readBody(req, 4096));
+  if (!o || typeof o.current !== "string" || typeof o.next !== "string") return { error: "Send the current and the new password." };
+  if (o.next === o.current) return { error: "The new password is the same as the current one." };
+  if (o.next.length < PW_MIN) return { error: `The new password needs at least ${PW_MIN} characters.` };
+  if (o.next.length > PW_MAX) return { error: `The new password can have ${PW_MAX} characters at most.` };
+  if (!o.next.trim()) return { error: "The new password can't be only spaces." };
+  return { current: o.current, next: o.next };
 }
 /** The password from the sign-in form (a normal form post; JSON is accepted too). */
 async function readPassword(req) {
@@ -245,6 +274,11 @@ async function handleDb(req, res, url, store) {
 }
 
 // ---------- server ----------
+function statusBody(cfg, store, canChange, rec) {
+  const out = { ok: true, jira: !!(cfg.jiraEmail && cfg.jiraToken), site: cfg.jiraSite, db: store ? store.kind : null, hosted: !!cfg.hosted, auth: !!cfg.password };
+  if (cfg.password) Object.assign(out, { user: cfg.user, passwordChange: canChange, passwordChangedAt: rec ? rec.changedAt : null });
+  return out;
+}
 /** The request handler, shared by the Node server below and Vercel (api/index.js).
  *  opts.store: shared database (store.js) or null; opts.fetch: for tests. */
 function createHandler(cfg, opts) {
@@ -252,6 +286,20 @@ function createHandler(cfg, opts) {
   const fetchImpl = opts.fetch || globalThis.fetch;
   const store = opts.store || null;
   const fails = new Map(); // ip -> [timestamps] of wrong passwords
+  const canChange = !!(store && store.getAuth && store.putAuth);
+  // The stored password is read again at most every few seconds. On Vercel other running copies of the server
+  // therefore notice a change within AUTH_TTL_MS; the copy that made the change knows at once.
+  const AUTH_TTL_MS = 5000;
+  let authCache = { at: -Infinity, rec: null };
+  async function authRecord(now) {
+    if (!canChange || !cfg.password) return null;
+    if (now - authCache.at < AUTH_TTL_MS) return authCache.rec;
+    try { authCache = { at: now, rec: activeRecord(await store.getAuth(), cfg) }; }
+    catch (e) { if (authCache.at === -Infinity) throw e; } // database down: keep using what we last knew
+    return authCache.rec;
+  }
+  const tooMany = (ip, now) => (fails.get(ip) || []).filter((t) => now - t < LOCK_MS).length >= MAX_FAILS;
+  const failed = (ip, now) => { const r = (fails.get(ip) || []).filter((t) => now - t < LOCK_MS); r.push(now); fails.set(ip, r); return MAX_FAILS - r.length; };
   return async (req, res) => {
     try {
       const url = new URL(req.url, "http://x");
@@ -267,7 +315,11 @@ function createHandler(cfg, opts) {
         if (url.pathname === "/login" || url.pathname === "/logout") return send(res, 303, "", { Location: "/" });
       } else {
         const now = Date.now();
-        const signedIn = tokenOk(readCookie(req, COOKIE), cfg, now);
+        let rec;
+        try { rec = await authRecord(now); }
+        catch (e) { return send(res, 503, isApi ? { code: "unavailable", message: "The database didn't answer. Try again in a minute." } : "The database didn't answer. Try again in a minute.", isApi ? {} : { "Content-Type": "text/plain; charset=utf-8" }); }
+        const key = sessionKey(cfg, rec);
+        const signedIn = tokenOk(readCookie(req, COOKIE), key, now);
         if (url.pathname === "/logout") {
           if (req.method !== "POST") return send(res, 303, "", { Location: signedIn ? "/" : "/login" });
           return send(res, 303, "", { Location: "/login", "Set-Cookie": cookieHeader(req, cfg, "", 0) });
@@ -275,26 +327,42 @@ function createHandler(cfg, opts) {
         if (url.pathname === "/login") {
           if (req.method === "GET") return signedIn ? send(res, 303, "", { Location: "/" }) : send(res, 200, loginPage(cfg, ""), html);
           if (req.method !== "POST") return send(res, 405, "Not allowed.", { "Content-Type": "text/plain; charset=utf-8" });
-          const recent = (fails.get(ip) || []).filter((t) => now - t < LOCK_MS);
-          if (recent.length >= MAX_FAILS) return send(res, 429, loginPage(cfg, "Too many wrong passwords. Try again in 15 minutes."), html);
+          if (tooMany(ip, now)) return send(res, 429, loginPage(cfg, "Too many wrong passwords. Try again in 15 minutes."), html);
           let given = "";
           try { given = await readPassword(req); } catch (e) { return send(res, 400, loginPage(cfg, "That didn't work. Please try again."), html); }
-          if (!passwordOk(given, cfg)) {
-            recent.push(now); fails.set(ip, recent);
-            const left = MAX_FAILS - recent.length;
+          if (!passwordOk(given, cfg, rec)) {
+            const left = failed(ip, now);
             return send(res, 401, loginPage(cfg, left > 0 ? "Wrong password. Please try again." : "Too many wrong passwords. Try again in 15 minutes."), html);
           }
           fails.delete(ip);
-          return send(res, 303, "", { Location: "/", "Set-Cookie": cookieHeader(req, cfg, makeToken(cfg, now), SESSION_MS / 1000) });
+          return send(res, 303, "", { Location: "/", "Set-Cookie": cookieHeader(req, cfg, makeToken(key, now), SESSION_MS / 1000) });
         }
         if (!signedIn) {
           if (isApi) return send(res, 401, { code: "login_required", message: "Sign in first." });
           return send(res, 303, "", { Location: "/login" });
         }
+        if (url.pathname === "/api/password") {
+          if (req.method !== "POST") return send(res, 405, { code: "bad_request", message: "Use POST." });
+          if (!canChange) return send(res, 503, { code: "no_database", message: "Changing the password needs the shared database. Until then, change APP_PASSWORD on the server." });
+          if (tooMany(ip, now)) return send(res, 429, { code: "too_many", message: "Too many wrong passwords. Try again in 15 minutes." });
+          let ch;
+          try { ch = await readPasswordChange(req); } catch (e) { return send(res, 400, { code: "bad_request", message: "Send a small JSON body." }); }
+          if (ch.error) return send(res, 400, { code: "invalid_argument", message: ch.error });
+          if (!passwordOk(ch.current, cfg, rec)) {
+            const left = failed(ip, now);
+            return send(res, left > 0 ? 403 : 429, { code: "wrong_password", message: left > 0 ? "The current password is wrong." : "Too many wrong passwords. Try again in 15 minutes." });
+          }
+          const next = makeAuthRecord(cfg, ch.next, now);
+          await store.putAuth(next);
+          authCache = { at: now, rec: next };
+          // Everyone else is signed out (their cookies were signed with the old key). This browser stays signed in.
+          return send(res, 200, { ok: true, changedAt: next.changedAt }, { "Set-Cookie": cookieHeader(req, cfg, makeToken(sessionKey(cfg, next), now), SESSION_MS / 1000) });
+        }
+        if (url.pathname === "/api/status" && req.method === "GET") {
+          return send(res, 200, statusBody(cfg, store, canChange, rec));
+        }
       }
-      if (req.method === "GET" && url.pathname === "/api/status") {
-        return send(res, 200, { ok: true, jira: !!(cfg.jiraEmail && cfg.jiraToken), site: cfg.jiraSite, db: store ? store.kind : null, hosted: !!cfg.hosted, auth: !!cfg.password });
-      }
+      if (req.method === "GET" && url.pathname === "/api/status") return send(res, 200, statusBody(cfg, store, canChange, null));
       if (url.pathname === "/api/db" || url.pathname === "/api/db/doc") return await handleDb(req, res, url, store);
       if (url.pathname === "/api/jira/search") {
         if (req.method !== "POST") return send(res, 405, { code: "bad_request", message: "Use POST." });

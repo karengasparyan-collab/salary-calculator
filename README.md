@@ -134,7 +134,15 @@ The Jira CSV export (*Export → Export CSV (all fields)*) still works as a fall
   leaves `Secure` out, or the browser would never send it back). The server keeps no list of sessions: the cookie is
   an expiry time signed with HMAC-SHA256, using a key made from `APP_PASSWORD`. It can't be forged or extended, and it
   never contains the password.
-- **Signing everyone out:** change `APP_PASSWORD` in Vercel and redeploy. Every old cookie stops working at once.
+- **Changing the password:** Settings → Password (needs the shared database). Type the current password and the new
+  one twice. The new one is stored only as a salted scrypt hash, in its own database key: it is not part of the
+  shared documents, not in backups, and "Restore from backup" doesn't touch it. Everyone else is signed out at once
+  (on Vercel, other running copies of the server notice within 5 seconds); the browser that made the change stays in.
+  Wrong "current password" tries count toward the same 10-tries lock as the sign-in page.
+- **Forgot the password set in Settings?** Change `APP_PASSWORD` in Vercel and redeploy. The stored password is tied
+  to the `APP_PASSWORD` it replaced, so a new `APP_PASSWORD` makes it stop working and the new one works again.
+- **Signing everyone out:** change the password in Settings, or change `APP_PASSWORD` in Vercel and redeploy. Every
+  old cookie stops working at once.
   `SESSION_SECRET` is optional: if you set it, it is mixed into the signing key too (changing it also signs everyone
   out, without changing the password). You don't need to add it.
 - **Log out** is the button at the right end of the top bar. It removes the cookie from that browser.

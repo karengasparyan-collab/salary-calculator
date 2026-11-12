@@ -278,7 +278,7 @@ async function step(name, fn) {
   });
   await step("server: Pull from Jira → 820,800", async () => {
     await sp.waitForFunction(() => window.__glana && window.__glana.S.mode === "server");
-    assert.deepStrictEqual(await sp.evaluate(() => window.__glana.S.jiraServer), { ok: true, jira: true, site: "glana.atlassian.net", db: "memory", hosted: false, auth: true });
+    assert.deepStrictEqual(await sp.evaluate(() => window.__glana.S.jiraServer), { ok: true, jira: true, site: "glana.atlassian.net", db: "memory", hosted: false, auth: true, user: "glana", passwordChange: true, passwordChangedAt: null });
     assert.ok(await sp.isVisible("#logoutForm button"));
     assert.match(await sp.innerText("#banners"), /shared with everyone who has the password/);
     await sp.click('nav.tabs [data-tab="team"]');

@@ -127,7 +127,7 @@ const get = (url, headers) => fetch(url, { redirect: "manual", headers: headers 
     assert.strictEqual(r.headers.get("x-frame-options"), "DENY");
   });
   await t("status says Jira is connected", async () => {
-    assert.deepStrictEqual(await (await fetch(base + "/api/status", { headers: AUTH })).json(), { ok: true, jira: true, site: "glana.atlassian.net", db: null, hosted: false, auth: true });
+    assert.deepStrictEqual(await (await fetch(base + "/api/status", { headers: AUTH })).json(), { ok: true, jira: true, site: "glana.atlassian.net", db: null, hosted: false, auth: true, user: "glana", passwordChange: false, passwordChangedAt: null });
   });
 
   let pulled = [];
@@ -256,6 +256,62 @@ const get = (url, headers) => fetch(url, { redirect: "manual", headers: headers 
     s.close();
   }
   await dbSuite("memory db", DB.MemoryStore());
+
+  // ---------- Settings → Password ----------
+  const changePw = (b, cookie, body, raw) => fetch(b + "/api/password", { method: "POST", redirect: "manual", headers: { cookie, "content-type": "application/json" }, body: raw || JSON.stringify(body) });
+  await t("password: change it, old cookies stop working, this browser stays in", async () => {
+    const store = DB.MemoryStore({ "team/a": { name: "A" } });
+    const s = createServer(configFromEnv({ APP_PASSWORD: "pw-123" }), { store }); const b = await listen(s);
+    const me = cookieOf(await signIn(b, "pw-123")), other = cookieOf(await signIn(b, "pw-123"));
+    const st = await (await get(b + "/api/status", { cookie: me })).json();
+    assert.strictEqual(st.passwordChange, true); assert.strictEqual(st.passwordChangedAt, null);
+    assert.strictEqual((await fetch(b + "/api/password", { headers: { cookie: me } })).status, 405);
+    assert.strictEqual((await changePw(b, "", { current: "pw-123", next: "new-password-1" })).status, 401);
+    for (const [body, re] of [[{ current: "pw-123", next: "short" }, /at least 8/], [{ current: "pw-123", next: "pw-123" }, /same/], [{ current: "pw-123", next: "        " }, /spaces/], [{ current: "pw-123", next: "x".repeat(201) }, /200/], [{ next: "new-password-1" }, /current/]]) {
+      const r = await changePw(b, me, body); assert.strictEqual(r.status, 400); assert.match((await r.json()).message, re);
+    }
+    assert.strictEqual((await changePw(b, me, null, "{oops")).status, 400);
+    const wrong = await changePw(b, me, { current: "nope", next: "new-password-1" });
+    assert.strictEqual(wrong.status, 403); assert.strictEqual((await wrong.json()).code, "wrong_password");
+    const ok = await changePw(b, me, { current: "pw-123", next: "new-password-1" });
+    assert.strictEqual(ok.status, 200);
+    const fresh = cookieOf(ok); assert.match(ok.headers.get("set-cookie"), /^glana_session=v1\.\d+\.[\w-]{43}; Path=\/; Max-Age=604800; HttpOnly; SameSite=Lax$/);
+    // the record holds a hash, never the password, and is not in the shared documents or backups
+    const rec = await store.getAuth(); assert.ok(rec.hash && rec.salt); assert.ok(!JSON.stringify(rec).includes("new-password-1"));
+    assert.deepStrictEqual(Object.keys((await (await get(b + "/api/db", { cookie: fresh })).json()).docs), ["team/a"]);
+    assert.strictEqual((await get(b + "/api/status", { cookie: me })).status, 401);
+    assert.strictEqual((await get(b + "/api/status", { cookie: other })).status, 401);
+    const st2 = await (await get(b + "/api/status", { cookie: fresh })).json(); assert.strictEqual(st2.passwordChangedAt, rec.changedAt);
+    assert.strictEqual((await signIn(b, "pw-123")).status, 401);
+    assert.strictEqual((await signIn(b, "new-password-1")).status, 303);
+    // restoring a backup keeps the new password
+    await fetch(b + "/api/db", { method: "PUT", headers: { cookie: fresh, "content-type": "application/json" }, body: JSON.stringify({ docs: {} }) });
+    assert.strictEqual((await signIn(b, "new-password-1")).status, 303);
+    s.close();
+    // a fresh copy of the server (Vercel) reads it from the database
+    const s2 = createServer(configFromEnv({ APP_PASSWORD: "pw-123" }), { store }); const b2 = await listen(s2);
+    assert.strictEqual((await get(b2 + "/api/status", { cookie: fresh })).status, 200);
+    assert.strictEqual((await signIn(b2, "pw-123")).status, 401);
+    s2.close();
+    // forgot it? changing APP_PASSWORD on the server brings the server password back
+    const s3 = createServer(configFromEnv({ APP_PASSWORD: "reset-pw" }), { store }); const b3 = await listen(s3);
+    assert.strictEqual((await signIn(b3, "new-password-1")).status, 401);
+    assert.strictEqual((await signIn(b3, "reset-pw")).status, 303);
+    s3.close();
+  });
+  await t("password: wrong current passwords count toward the sign-in lock", async () => {
+    const s = createServer(configFromEnv({ APP_PASSWORD: "pw-123" }), { store: DB.MemoryStore() }); const b = await listen(s);
+    const me = cookieOf(await signIn(b, "pw-123"));
+    for (let i = 0; i < 9; i++) assert.strictEqual((await changePw(b, me, { current: "bad", next: "new-password-1" })).status, 403);
+    assert.strictEqual((await changePw(b, me, { current: "bad", next: "new-password-1" })).status, 429);
+    assert.strictEqual((await changePw(b, me, { current: "pw-123", next: "new-password-1" })).status, 429);
+    assert.strictEqual((await signIn(b, "pw-123")).status, 429);
+    s.close();
+  });
+  await t("password: without a database it can't be changed (clear 503)", async () => {
+    const r = await changePw(base, AUTH.cookie, { current: "pw-123", next: "new-password-1" });
+    assert.strictEqual(r.status, 503); assert.strictEqual((await r.json()).code, "no_database");
+  });
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "glana-"));
   const file = path.join(tmp, "db.json");
   await dbSuite("file db", DB.FileStore(file));
@@ -263,10 +319,15 @@ const get = (url, headers) => fetch(url, { redirect: "manual", headers: headers 
     const again = DB.FileStore(file);
     assert.deepStrictEqual((await again.all()).docs, { "team/a": { name: "A" }, "config/settings": { basePct: 80 } });
   });
+  await t("file db keeps the password record across restarts and restores", async () => {
+    const a = DB.FileStore(file); await a.putAuth({ v: 1, hash: "h" });
+    await a.replaceAll({ "team/b": { name: "B" } });
+    assert.deepStrictEqual(await DB.FileStore(file).getAuth(), { v: 1, hash: "h" });
+  });
   fs.rmSync(tmp, { recursive: true, force: true });
 
   // fake Upstash REST API (just the commands store.js uses)
-  const hash = new Map(); let rev = 0; const seen = [];
+  const hash = new Map(); const kv = new Map(); let rev = 0; const seen = [];
   const run = (c) => {
     const [cmd, ...a] = c; seen.push(cmd);
     if (cmd === "HGETALL") return [...hash].flat();
@@ -275,6 +336,8 @@ const get = (url, headers) => fetch(url, { redirect: "manual", headers: headers 
     if (cmd === "HDEL") return hash.delete(a[1]) ? 1 : 0;
     if (cmd === "DEL") { hash.clear(); return 1; }
     if (cmd === "INCR") return ++rev;
+    if (cmd === "GET" && a[0].endsWith(":auth")) return kv.has(a[0]) ? kv.get(a[0]) : null;
+    if (cmd === "SET") { kv.set(a[0], a[1]); return "OK"; }
     if (cmd === "GET") return rev ? String(rev) : null;
     throw new Error("unknown " + cmd);
   };
@@ -288,6 +351,11 @@ const get = (url, headers) => fetch(url, { redirect: "manual", headers: headers 
   });
   const upUrl = await listen(upstash);
   await dbSuite("redis db", DB.storeFromEnv({ KV_REST_API_URL: upUrl, KV_REST_API_TOKEN: "up-token", VERCEL: "1" }, "/nowhere"));
+  await t("redis db keeps the password record", async () => {
+    const r = DB.RedisStore(upUrl, "up-token"); assert.strictEqual(await r.getAuth(), null);
+    await r.putAuth({ v: 1, hash: "h" }); assert.deepStrictEqual(await r.getAuth(), { v: 1, hash: "h" });
+    assert.ok(!(await r.all()).docs["auth"]);
+  });
   await t("redis db uses transactions for writes", () => assert.ok(seen.includes("INCR") && seen.includes("HGETALL")));
   await t("redis db: wrong token → clear error", async () => {
     const bad = DB.RedisStore(upUrl, "nope");

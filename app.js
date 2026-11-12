@@ -282,7 +282,11 @@ function render() {
   const v = $("#view");
   const scroll = window.scrollY;
   if (S.mode === "loading") { v.innerHTML = `<div class="empty loading"><div class="sk-grid" aria-hidden="true"><span class="sk"></span><span class="sk"></span><span class="sk"></span><span class="sk"></span></div><span class="sk sk-table" aria-hidden="true"></span><p>Loading saved data…</p></div>`; return; }
+  // Keep a half-typed password when shared data arrives and the view is redrawn.
+  const typed = [...v.querySelectorAll(".pwform input[type=password]")].map((i) => [i.name, i.value]); const focused = document.activeElement && document.activeElement.closest(".pwform") ? document.activeElement.name : null;
   v.innerHTML = ({ payroll: viewPayroll, tasks: viewTasks, hours: viewHours, incidents: viewIncidents, team: viewTeam, settings: viewSettings })[S.tab]();
+  for (const [n, val] of typed) { const i = v.querySelector(`.pwform [name=${n}]`); if (i) i.value = val; }
+  if (focused) { const i = v.querySelector(`.pwform [name=${focused}]`); if (i) i.focus(); }
   window.scrollTo(0, scroll);
   bindDrops();
   if (S.animatePull && S.tab === "tasks") { clearTimeout(S.animT); S.animT = setTimeout(playPullAnim, 180); }
@@ -664,8 +668,46 @@ function viewSettings() {
     </div>
   </div>
   <div class="card pad section"><h3 style="margin-top:0">Public holidays (Armenia)</h3><p class="small muted" style="margin-top:0">One date per line (YYYY-MM-DD). Not counted as working days or late days. Add government-announced extra days off here.</p><textarea data-set="holidays" data-live="0" style="min-height:140px">${esc(c.holidays.join("\n"))}</textarea></div>
+  ${passwordCard()}
   ${S.mode === "browser" || S.mode === "server" ? `<div class="card pad section"><h3 style="margin-top:0">Backup</h3><p class="small muted" style="margin-top:0">${S.mode === "server" ? "Everything (team, salaries, months, tasks, incidents, settings) is saved on the Glana server. Download a backup now and then to keep a copy of your own. Restoring replaces the shared data for everyone." : "Everything (team, salaries, months, tasks, incidents, settings) is saved in this browser only. Download a backup regularly, and use it to move the data to another computer. Clearing the browser's site data deletes it."}</p><div class="row"><button class="btn" data-action="backup-download">${ICON.download}Download backup</button><label class="btn">${ICON.upload}Restore from backup<input type="file" accept=".json,application/json" data-file="backup" hidden></label></div></div>` : ""}
   <div class="row section savebar"><button class="btn primary" data-action="settings-save">Save settings</button><button class="btn ghost" data-action="settings-reset">Reset to document defaults</button><span class="small muted">${S.settingsStored ? "Custom settings saved." : "Using the document defaults."}</span></div>`;
+}
+
+/** Settings → Password. Only where the site has a sign-in (served by server.js with APP_PASSWORD). */
+function passwordCard() {
+  const st = S.jiraServer;
+  if (!st || !st.auth) return "";
+  const head = `<div class="card pad section"><h3 style="margin-top:0">Password</h3>`;
+  if (!st.passwordChange) return head + `<p class="small muted" style="margin:0">The website password is <code>APP_PASSWORD</code> on the server. To change it from here, connect the shared database (Vercel: Storage → Upstash for Redis). Until then, change <code>APP_PASSWORD</code> in Vercel and redeploy.</p></div>`;
+  const when = st.passwordChangedAt ? `Last changed ${esc(new Date(st.passwordChangedAt).toLocaleString())}.` : "Still the password set on the server (APP_PASSWORD).";
+  return head + `<p class="small muted" style="margin-top:0">One password for everyone who uses the site. After a change, everyone else is signed out and needs the new password; you stay signed in. ${when}</p>
+  <form data-form="password" class="pwform" autocomplete="on">
+    <input type="text" name="username" autocomplete="username" value="${esc(st.user || "glana")}" hidden readonly>
+    <label class="f">Current password<input type="password" name="current" autocomplete="current-password" required maxlength="200"></label>
+    <label class="f">New password<input type="password" name="next" autocomplete="new-password" required minlength="8" maxlength="200"></label>
+    <label class="f">Repeat the new password<input type="password" name="again" autocomplete="new-password" required minlength="8" maxlength="200"></label>
+    <div class="row"><button class="btn primary" type="submit">Change password</button><span class="small muted">At least 8 characters. A long phrase is best.</span></div>
+  </form>
+  <p class="small muted" style="margin-bottom:0">Forgot it? Change <code>APP_PASSWORD</code> in Vercel and redeploy: that password works again and replaces the one set here.</p></div>`;
+}
+async function changePassword(form, fd) {
+  if (fd.next !== fd.again) return toast("The new passwords don't match.");
+  if (fd.next.length < 8) return toast("The new password needs at least 8 characters.");
+  if (fd.next === fd.current) return toast("The new password is the same as the current one.");
+  const btn = form.querySelector("button[type=submit]"); if (btn) btn.disabled = true;
+  try {
+    const r = await fetch("api/password", { method: "POST", credentials: "same-origin", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ current: fd.current, next: fd.next }) });
+    const out = await r.json().catch(() => ({}));
+    if (!r.ok) {
+      if (out.code === "login_required") return toast("Your sign-in expired. Reload the page and sign in again.");
+      return toast(out.message || "Couldn't change the password.");
+    }
+    form.reset();
+    S.jiraServer = Object.assign({}, S.jiraServer, { passwordChangedAt: out.changedAt });
+    render();
+    toast("Password changed. Everyone else needs the new password now.");
+  } catch (e) { toast("Couldn't reach the server. Check the connection and try again."); }
+  finally { if (btn && btn.isConnected) btn.disabled = false; }
 }
 
 // ---------------- actions ----------------
@@ -711,6 +753,7 @@ document.addEventListener("submit", async (ev) => {
   if (form.id === "logoutForm") return; // a normal form post to /logout: the server clears the cookie
   ev.preventDefault();
   const fd = Object.fromEntries(new FormData(form).entries());
+  if (form.dataset.form === "password") return changePassword(form, fd);
   if (form.dataset.form === "incident") {
     const doc = { memberId: fd.memberId, date: fd.date, level: fd.level, note: fd.note.trim(), aiSlop: !!fd.aiSlop, createdAt: new Date().toISOString() };
     if (!doc.note) return toast("Describe what happened.");
