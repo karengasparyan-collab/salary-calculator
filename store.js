@@ -3,7 +3,14 @@
  *
  *   FileStore   one JSON file on this computer (npm start)
  *   RedisStore  Upstash Redis over its REST API (Vercel: Storage → Upstash for Redis). No packages needed.
- *   MemoryStore for tests */
+ *   MemoryStore for tests
+ *
+ * Each store also keeps one sign-in record (getAuth / putAuth: the hashed website password set in Settings).
+ * It lives outside the documents on purpose: /api/db never returns it, backups don't contain it,
+ * and "Restore from backup" (replaceAll) leaves it alone. The same is true of the two other things kept beside
+ * the documents:
+ *   change history   addLog(entry) / getLog(limit)            newest first, the last LOG_MAX entries
+ *   server backups   addBackup({id, at, reason, docs}, keep) / listBackups() / getBackup(id) */
 "use strict";
 const fs = require("fs");
 const path = require("path");
@@ -13,6 +20,8 @@ const PATH_RE = /^(config\/settings|debug\/lastPull|team\/[A-Za-z0-9_-]{1,64}|mo
 const validPath = (p) => typeof p === "string" && PATH_RE.test(p);
 const isObj = (v) => v && typeof v === "object" && !Array.isArray(v);
 const clone = (o) => JSON.parse(JSON.stringify(o));
+const LOG_MAX = 2000;
+const backupMeta = (b) => ({ id: b.id, at: b.at, reason: b.reason, count: Object.keys(b.docs).length });
 /** Deep merge used by "update" (identical to the app's MemDB merge). */
 function merge(a, b) {
   const o = Object.assign({}, a);
@@ -43,9 +52,16 @@ function checkAll(docs) {
 
 // ---------- in memory (tests) ----------
 function MemoryStore(initial) {
-  let docs = new Map(Object.entries(initial || {})); let rev = 0;
+  let docs = new Map(Object.entries(initial || {})); let rev = 0; let auth = null; let log = []; let backups = [];
   return {
     kind: "memory",
+    async getAuth() { return auth ? clone(auth) : null; },
+    async putAuth(a) { auth = clone(a); },
+    async addLog(e) { log.unshift(clone(e)); log.length = Math.min(log.length, LOG_MAX); },
+    async getLog(n) { return clone(log.slice(0, n)); },
+    async addBackup(b, keep) { backups.unshift(clone(b)); backups.length = Math.min(backups.length, keep); },
+    async listBackups() { return backups.map(backupMeta); },
+    async getBackup(id) { const b = backups.find((x) => x.id === id); return b ? clone(b) : null; },
     async all() { return { docs: Object.fromEntries([...docs].map(([k, v]) => [k, clone(v)])), rev }; },
     async rev() { return rev; },
     async get(p) { return docs.has(p) ? clone(docs.get(p)) : null; },
@@ -58,26 +74,37 @@ function MemoryStore(initial) {
 // ---------- one JSON file ----------
 function FileStore(file) {
   fs.mkdirSync(path.dirname(file), { recursive: true });
-  const read = () => { try { const d = JSON.parse(fs.readFileSync(file, "utf8")); return { docs: d.docs || {}, rev: d.rev || 0 }; } catch (e) { return { docs: {}, rev: 0 }; } };
+  const read = () => { try { const d = JSON.parse(fs.readFileSync(file, "utf8")); return { docs: d.docs || {}, rev: d.rev || 0, auth: d.auth || null, log: Array.isArray(d.log) ? d.log : [] }; } catch (e) { return { docs: {}, rev: 0, auth: null, log: [] }; } };
+  const bdir = path.join(path.dirname(file), "backups");
+  const bfile = (id) => path.join(bdir, id + ".json");
+  const blist = () => { try { return fs.readdirSync(bdir).filter((f) => /^[A-Za-z0-9_-]+\.json$/.test(f)).map((f) => { try { return JSON.parse(fs.readFileSync(path.join(bdir, f), "utf8")); } catch (e) { return null; } }).filter((b) => b && b.id && b.docs).sort((a, b) => (a.at < b.at ? 1 : -1)); } catch (e) { return []; } };
   let state = read();
   let queue = Promise.resolve();
   const save = () => { const tmp = file + ".tmp"; fs.writeFileSync(tmp, JSON.stringify(state)); fs.renameSync(tmp, file); };
   const serial = (fn) => (queue = queue.then(fn, fn));
   return {
     kind: "file",
+    async getAuth() { return state.auth ? clone(state.auth) : null; },
+    putAuth: (a) => serial(() => { state.auth = clone(a); save(); }),
+    addLog: (e) => serial(() => { state.log.unshift(clone(e)); state.log.length = Math.min(state.log.length, LOG_MAX); save(); }),
+    async getLog(n) { return clone(state.log.slice(0, n)); },
+    addBackup: (b, keep) => serial(() => { fs.mkdirSync(bdir, { recursive: true }); fs.writeFileSync(bfile(b.id), JSON.stringify(b)); for (const old of blist().slice(keep)) fs.rmSync(bfile(old.id), { force: true }); }),
+    async listBackups() { return blist().map(backupMeta); },
+    async getBackup(id) { return /^[A-Za-z0-9_-]+$/.test(id) && fs.existsSync(bfile(id)) ? JSON.parse(fs.readFileSync(bfile(id), "utf8")) : null; },
     async all() { return { docs: clone(state.docs), rev: state.rev }; },
     async rev() { return state.rev; },
     async get(p) { return state.docs[p] ? clone(state.docs[p]) : null; },
     put: (p, d) => serial(() => { state.docs[p] = clone(d); state.rev++; save(); }),
     del: (p) => serial(() => { delete state.docs[p]; state.rev++; save(); }),
-    replaceAll: (all) => serial(() => { state = { docs: clone(all), rev: state.rev + 1 }; save(); }),
+    replaceAll: (all) => serial(() => { state = { docs: clone(all), rev: state.rev + 1, auth: state.auth, log: state.log }; save(); }),
   };
 }
 
 // ---------- Upstash Redis (REST) ----------
 function RedisStore(url, token, prefix, fetchImpl) {
   const base = String(url).replace(/\/+$/, "");
-  const H = (prefix || "glanapay") + ":docs", REV = (prefix || "glanapay") + ":rev";
+  const H = (prefix || "glanapay") + ":docs", REV = (prefix || "glanapay") + ":rev", AUTH = (prefix || "glanapay") + ":auth", LOG = (prefix || "glanapay") + ":log", BK = (prefix || "glanapay") + ":backups", BKM = (prefix || "glanapay") + ":backupmeta";
+  const CHUNK = 350000; // a backup is stored in pieces: Upstash limits the size of one request
   const f = fetchImpl || globalThis.fetch;
   async function call(pathPart, body) {
     let r;
@@ -91,6 +118,30 @@ function RedisStore(url, token, prefix, fetchImpl) {
   const tx = async (cmds) => { const d = await call("/multi-exec", cmds); const bad = Array.isArray(d) && d.find((x) => x && x.error); if (bad) throw { status: 503, code: "unavailable", message: bad.error }; return d; };
   return {
     kind: "redis",
+    async getAuth() { const v = await cmd("GET", AUTH); return v == null ? null : JSON.parse(v); },
+    async putAuth(a) { await cmd("SET", AUTH, JSON.stringify(a)); },
+    async addLog(e) { await tx([["LPUSH", LOG, JSON.stringify(e)], ["LTRIM", LOG, 0, LOG_MAX - 1]]); },
+    async getLog(n) { return ((await cmd("LRANGE", LOG, 0, n - 1)) || []).map((x) => { try { return JSON.parse(x); } catch (e) { return null; } }).filter(Boolean); },
+    async listBackups() {
+      const flat = (await cmd("HGETALL", BKM)) || []; const out = [];
+      for (let i = 0; i < flat.length; i += 2) { try { out.push(JSON.parse(flat[i + 1])); } catch (e) {} }
+      return out.sort((a, b) => (a.at < b.at ? 1 : -1));
+    },
+    async addBackup(b, keep) {
+      const text = JSON.stringify(b.docs); const parts = Math.max(1, Math.ceil(text.length / CHUNK));
+      for (let i = 0; i < parts; i++) await cmd("HSET", BK, b.id + ":" + i, text.slice(i * CHUNK, (i + 1) * CHUNK));
+      await cmd("HSET", BKM, b.id, JSON.stringify(Object.assign(backupMeta(b), { parts })));
+      for (const old of (await this.listBackups()).slice(keep)) {
+        const del = ["HDEL", BK]; for (let i = 0; i < (old.parts || 1); i++) del.push(old.id + ":" + i);
+        await tx([del, ["HDEL", BKM, old.id]]);
+      }
+    },
+    async getBackup(id) {
+      const raw = await cmd("HGET", BKM, id); if (raw == null) return null;
+      const meta = JSON.parse(raw); let text = "";
+      for (let i = 0; i < (meta.parts || 1); i++) text += (await cmd("HGET", BK, id + ":" + i)) || "";
+      return { id: meta.id, at: meta.at, reason: meta.reason, docs: JSON.parse(text) };
+    },
     async all() {
       const d = await call("/pipeline", [["HGETALL", H], ["GET", REV]]);
       const flat = (d[0] && d[0].result) || [];

@@ -26,6 +26,16 @@
     shadowMonths: ["2026-12", "2027-01"],
     jiraSite: "99b8e946-94d7-4938-96a7-e73559c4816a",   // glana.atlassian.net
     jiraProjects: "GOD, PRJ, AWE",
+    // Taxes (off by default). When on, payslips also show what is withheld and the net pay. Armenian rules:
+    // income tax 20%; funded pension 5% of gross up to 500,000, above that 10% of gross − 25,000, at most 87,500;
+    // stamp duty by gross salary. Check the numbers with your accountant: the rates change.
+    tax: {
+      enabled: false, incomeTaxPct: 20,
+      pension: true, pensionLowPct: 5, pensionThreshold: 500000, pensionHighPct: 10, pensionHighMinus: 25000, pensionMax: 87500,
+      stampDuty: true, stampTiers: [[100000, 1500], [200000, 3000], [500000, 5500], [1000000, 8500], [null, 15000]],
+    },
+    // Reminder before payday: a banner when the month to be paid is not ready. Payday is `day` of the following month.
+    payday: { enabled: true, day: 5, daysBefore: 5 },
     // Armenian public holidays (non-working). Edit in Settings.
     holidays: [
       "2026-09-21", "2026-12-31",
@@ -312,6 +322,30 @@
     return [member.jiraName, member.name].filter(Boolean).map(norm).includes(a);
   }
 
+  /** The salary in force in `month`. member.salaryHistory = [{ from: "YYYY-MM", salary }] (a raise counts from its month
+   *  on, earlier months keep the earlier salary). Without a history, member.salary applies to every month. */
+  function salaryFor(member, month) {
+    const h = (member.salaryHistory || []).filter((x) => x && x.from && Number(x.salary) > 0).sort((a, b) => (a.from < b.from ? -1 : 1));
+    if (!h.length) return Number(member.salary) || 0;
+    let cur = h[0];
+    for (const x of h) if (x.from <= month) cur = x;
+    return Number(cur.salary) || 0;
+  }
+  /** What is withheld from a gross amount, and the net. t = settings.tax. */
+  function netPay(gross, t) {
+    gross = Math.max(0, Math.round(Number(gross) || 0));
+    const incomeTax = Math.round(gross * (Number(t.incomeTaxPct) || 0) / 100);
+    let pension = 0;
+    if (t.pension) {
+      pension = gross <= t.pensionThreshold ? gross * t.pensionLowPct / 100 : gross * t.pensionHighPct / 100 - t.pensionHighMinus;
+      pension = Math.round(Math.max(0, Math.min(pension, t.pensionMax > 0 ? t.pensionMax : Infinity)));
+    }
+    let stamp = 0;
+    if (t.stampDuty && gross > 0) for (const [upTo, amount] of t.stampTiers || []) { stamp = amount; if (upTo == null || gross <= upTo) break; }
+    const withheld = incomeTax + pension + stamp;
+    return { gross, incomeTax, pension, stamp, withheld, net: gross - withheld };
+  }
+
   /** Full monthly result for one person.
    *  member: {id, name, jiraName, salary, start?, end?}
    *  input:  {hours: {worked, leave, sick, unpaid} | undefined, incidents: [...], tasks: [...all parsed tasks]} */
@@ -320,7 +354,7 @@
     const hol = holidaySet(cfg.holidays);
     const warnings = [];
     const [mStart, mEnd] = monthRange(month);
-    const salary = Number(member.salary) || 0;
+    const salary = salaryFor(member, month);
     const base = Math.round(salary * cfg.basePct / 100);
 
     // --- employment / proration ---
@@ -381,13 +415,15 @@
     const total = basePaid + bonus + extra;
     const shadow = (cfg.shadowMonths || []).includes(month);
     const currentPaid = Math.round(salary * prorate);
+    // In a shadow month people are paid their current salary, so that is what tax is withheld from.
+    const tax = cfg.tax && cfg.tax.enabled ? netPay(shadow ? currentPaid : total, Object.assign({}, DEFAULT_SETTINGS.tax, cfg.tax)) : null;
 
     return {
       memberId: member.id, name: member.name, month,
       salary, base, basePaid, prorate, monthDays, employedDays, paidDays,
       requiredDays, requiredHours, worked, leave, sick, unpaid, attendancePct, gate, hoursMissing, hoursSkipped,
       tasks: inMonth, tasksUsed: used.length, poolCount: pool.length, scoreBasis, score, band, bonusPct,
-      ethics, bonus, extra, extraNote, total, shadow, currentPaid, diff: total - currentPaid,
+      ethics, bonus, extra, extraNote, total, shadow, currentPaid, diff: total - currentPaid, tax,
       warnings: warnings.concat(ethics.flags),
     };
   }
@@ -502,7 +538,7 @@
   const api = {
     DEFAULT_SETTINGS, parseCSV, toCSV, parseDateTime, parseDate, workingDaysLate, workingDaysBetween, workingDaysInMonth,
     isWorkingDay, holidaySet, monthAdd, monthOf, mapColumns, parseJiraExport, timingPoints, qualityPoints, scoreTask,
-    bandFor, gateFor, ethicsFor, taskFromJiraApi, jiraJql, jiraRanges, splitRange, JIRA_FIELDS, computePerson, unmatchedAssignees, parseHoursFile, hoursValue, round1, norm, countable,
+    bandFor, gateFor, ethicsFor, taskFromJiraApi, jiraJql, jiraRanges, splitRange, JIRA_FIELDS, computePerson, unmatchedAssignees, parseHoursFile, hoursValue, round1, norm, countable, salaryFor, netPay,
   };
   if (typeof module !== "undefined" && module.exports) module.exports = api;
   else root.PayEngine = api;
