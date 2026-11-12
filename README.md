@@ -16,14 +16,15 @@ The full rules are in [`docs/SPEC.md`](docs/SPEC.md). If the spec and `engine.js
 |---|---|
 | `index.html` | The page: layout and styles (sidebar navigation, top bar with the pay month, payslip side panel; icon rail on tablets, bottom bar on phones). |
 | `engine.js` | All the pay math. Pure functions, no DOM. Runs in the browser, the server and the tests. |
-| `app.js` | The app: tabs, payslip, Jira pull and CSV import, hours import, incidents, team, settings, storage. |
+| `app.js` | The app: tabs, payslip, Jira pull and CSV import, hours import, incidents, team, analytics, history, settings, storage. |
 | `login.html` | The sign-in page (same colors and fonts as the app). |
-| `server.js` | Small Node server: serves the site behind a sign-in page, reads Jira with an API token, stores the shared data. No packages needed. |
+| `server.js` | Small Node server: serves the site behind a sign-in page (separate logins and permissions), reads Jira with an API token, stores the shared data, keeps the change history and backups. No packages needed. |
 | `store.js` | Shared data storage: a file on this computer, or Upstash Redis on Vercel. |
 | `api/index.js`, `vercel.json` | Runs the same server on Vercel. |
-| `test_engine.js` | 54 unit tests of the engine with hand-checked values. |
+| `test_engine.js` | 56 unit tests of the engine with hand-checked values. |
 | `tests/server.test.js` | Server tests: Jira paging, query checks, sign-in and cookie, which files are served, shared data (file, Redis). |
 | `tests/e2e.js` | Browser test of the full month flow, including Pull from Jira (820,800 AMD worked example). |
+| `tests/e2e_features.js`, `tests/seed.js` | Browser test of people and permissions, analytics, history, salary history, taxes, the payday reminder and backups, on ten months of made-up data. |
 
 ## Put it online with Vercel (one time, about 10 minutes)
 
@@ -122,6 +123,22 @@ The Jira CSV export (*Export → Export CSV (all fields)*) still works as a fall
 - **Opened as a plain file:** this browser only.
 - **Settings → Backup** downloads everything as one file, and restores it. **Try sample data** never touches saved data.
 
+## More than the monthly calculation
+
+- **Analytics** (left menu, under Insights): payroll by month, each person's bonus %, score, pay and attendance over
+  time, on-time delivery, first-time acceptance, incidents, a leaderboard, highlights in plain words, a score map and
+  a per-employee summary for the last 12 months or a calendar year (with CSV export). Hover or tap a chart for the
+  exact numbers. Every month is recalculated with today's settings.
+- **Salary history** (Team → Edit): when you change a salary you choose the month it counts from. Earlier months keep
+  the earlier salary, so past payslips and analytics don't change after a raise.
+- **Taxes on payslips** (Settings, off by default): shows income tax, funded pension and stamp duty withheld and the
+  net pay in hand, on the payslip, the payroll table and the CSV. Pay itself is not changed. The rates are the
+  Armenian ones in `engine.js` (`DEFAULT_SETTINGS.tax`); check them with your accountant.
+- **Payslips as PDF:** the *PDF* button on a payslip, or *Payslips (PDF)* on the Payroll page for everyone at once,
+  opens the browser's print window; choose "Save as PDF".
+- **Payday reminder** (Settings): in the days before payday a banner says what the month about to be paid still
+  needs (Jira tasks, hours, saved results).
+
 ## Security
 
 - Salaries are confidential. Without `APP_PASSWORD` the server only listens on this computer (127.0.0.1) and refuses
@@ -134,10 +151,25 @@ The Jira CSV export (*Export → Export CSV (all fields)*) still works as a fall
   leaves `Secure` out, or the browser would never send it back). The server keeps no list of sessions: the cookie is
   an expiry time signed with HMAC-SHA256, using a key made from `APP_PASSWORD`. It can't be forged or extended, and it
   never contains the password.
-- **Changing the password:** Settings → Password (needs the shared database). Type the current password and the new
-  one twice. The new one is stored only as a salted scrypt hash, in its own database key: it is not part of the
-  shared documents, not in backups, and "Restore from backup" doesn't touch it. Everyone else is signed out at once
-  (on Vercel, other running copies of the server notice within 5 seconds); the browser that made the change stays in.
+- **People (separate logins).** Settings → People, for admins. Add a person with a name, a login and a password
+  (you type the password and tell it to them). For each person choose: *View only*, *View and edit*, or *Admin*, and
+  which pages they see (Payroll, Jira tasks, Hours, Incidents, Team, Analytics). **Lock** signs a person out at once
+  and stops them signing in until you unlock them; **Remove** deletes the account. The server enforces all of it:
+  a view-only account's changes are refused, only admins reach Settings, People, History and backups, and a person
+  without the Payroll or Analytics page is never sent salaries or pay (the server strips them before answering).
+  The **owner** is the account that signs in with `APP_PASSWORD` (login `glana`, or the login left empty). It can do
+  everything and can't be locked or removed. Passwords are stored only as salted scrypt hashes.
+- **Change history.** The History page (admins) lists who changed what, newest first: salaries, hours, incidents,
+  extras, settings, Jira pulls, saved results, accounts, sign-ins, restores. The last 2,000 entries are kept beside
+  the data, so restoring a backup doesn't erase them. Passwords never appear in it.
+- **Automatic backups.** The server keeps its own copies: one before the first change of each week, one before every
+  restore, and one whenever an admin presses *Back up now* (Settings → Backup). The last 10 are kept and can be
+  downloaded or restored there.
+- **Changing the password:** Settings → Password (needs the shared database). Everyone changes their own; an
+  admin can also set a new one for someone in People. Type the current password and the new one twice. The new one is stored only as a salted scrypt hash, in its own database key: it is not part of the
+  shared documents, not in backups, and "Restore from backup" doesn't touch it. That person's other browsers are
+  signed out at once (on Vercel, other running copies of the server notice within 5 seconds); the browser that made
+  the change stays in. Other people's sign-ins are not affected.
   Wrong "current password" tries count toward the same 10-tries lock as the sign-in page.
 - **Forgot the password set in Settings?** Change `APP_PASSWORD` in Vercel and redeploy. The stored password is tied
   to the `APP_PASSWORD` it replaced, so a new `APP_PASSWORD` makes it stop working and the new one works again.

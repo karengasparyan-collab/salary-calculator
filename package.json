@@ -6,7 +6,7 @@
   "scripts": {
     "start": "node server.js",
     "test": "node test_engine.js && node tests/server.test.js",
-    "test:e2e": "node tests/e2e.js"
+    "test:e2e": "node tests/e2e.js && node tests/e2e_features.js"
   },
   "license": "UNLICENSED",
   "engines": {

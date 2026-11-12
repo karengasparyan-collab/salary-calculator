@@ -194,5 +194,30 @@ t("jira ranges + split", () => {
   assert.strictEqual(E.splitRange("2026-10-01", "2026-10-02"), null);
 });
 
+t("salary history: a raise counts from its month, earlier months keep the old salary", () => {
+  const m = { id: "x", name: "X", salary: 1000000, salaryHistory: [{ from: "2026-09", salary: 800000 }, { from: "2026-12", salary: 1000000 }] };
+  assert.strictEqual(E.salaryFor(m, "2026-11"), 800000); assert.strictEqual(E.salaryFor(m, "2026-12"), 1000000); assert.strictEqual(E.salaryFor(m, "2027-05"), 1000000);
+  assert.strictEqual(E.salaryFor(m, "2026-01"), 800000); // before the first entry: the first known salary
+  assert.strictEqual(E.salaryFor({ salary: 700000 }, "2026-11"), 700000); assert.strictEqual(E.salaryFor({ salary: 700000, salaryHistory: [] }, "2026-11"), 700000);
+  const q = (mo) => E.computePerson(m, mo, { tasks: [], hours: { worked: 999 }, incidents: [] }, cfg);
+  assert.strictEqual(q("2026-11").salary, 800000); assert.strictEqual(q("2026-11").base, 640000); assert.strictEqual(q("2027-02").base, 800000);
+});
+t("tax: off by default, Armenian rules when on", () => {
+  assert.strictEqual(E.computePerson(aniMember, "2026-11", { tasks: parsed.tasks, hours: { worked: 162.5, leave: 1 }, incidents: anIncidents }, cfg).tax, null);
+  const T = E.DEFAULT_SETTINGS.tax;
+  assert.deepStrictEqual(E.netPay(400000, T), { gross: 400000, incomeTax: 80000, pension: 20000, stamp: 5500, withheld: 105500, net: 294500 });
+  assert.deepStrictEqual(E.netPay(820800, T), { gross: 820800, incomeTax: 164160, pension: 57080, stamp: 8500, withheld: 229740, net: 591060 });
+  assert.strictEqual(E.netPay(500000, T).pension, 25000); assert.strictEqual(E.netPay(500001, T).pension, 25000);
+  assert.strictEqual(E.netPay(2000000, T).pension, 87500); assert.strictEqual(E.netPay(2000000, T).stamp, 15000);
+  assert.deepStrictEqual([90000, 100000, 100001, 200000, 1000000, 1000001].map((g) => E.netPay(g, T).stamp), [1500, 1500, 3000, 3000, 8500, 15000]);
+  assert.deepStrictEqual(E.netPay(0, T), { gross: 0, incomeTax: 0, pension: 0, stamp: 0, withheld: 0, net: 0 });
+  assert.deepStrictEqual(E.netPay(400000, Object.assign({}, T, { pension: false, stampDuty: false, incomeTaxPct: 10 })), { gross: 400000, incomeTax: 40000, pension: 0, stamp: 0, withheld: 40000, net: 360000 });
+  const on = Object.assign({}, cfg, { tax: { enabled: true } }); // stored settings may hold only the switch
+  const q = E.computePerson(aniMember, "2026-11", { tasks: parsed.tasks, hours: { worked: 162.5, leave: 1 }, incidents: anIncidents }, on);
+  assert.strictEqual(q.total, 820800); assert.strictEqual(q.tax.net, 591060);
+  const sh = E.computePerson(aniMember, "2026-12", { tasks: [], hours: { worked: 999 }, incidents: [] }, on); // shadow month: tax on the salary actually paid
+  assert.strictEqual(sh.shadow, true); assert.strictEqual(sh.tax.gross, sh.currentPaid);
+});
+
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);

@@ -60,8 +60,8 @@ button, input { font: inherit; color: inherit; }
 h1 { font-size: 24px; line-height: 1.2; letter-spacing: -.022em; font-weight: 700; margin: 0 0 6px; }
 .sub { color: var(--muted); margin: 0 0 20px; }
 label { display: flex; flex-direction: column; gap: 6px; font-size: 12.5px; color: var(--muted); font-weight: 600; }
-input[type=password] { width: 100%; min-height: 42px; padding: 8px 12px; border: 1px solid var(--line-2); border-radius: var(--r-sm); background: var(--surface); color: var(--ink); font-size: 16px; font-weight: 400; transition: border-color .15s, box-shadow .15s; }
-input[type=password]:focus { outline: 0; border-color: var(--accent); box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 22%, transparent); }
+input[type=password], input[type=text] { width: 100%; min-height: 42px; padding: 8px 12px; border: 1px solid var(--line-2); border-radius: var(--r-sm); background: var(--surface); color: var(--ink); font-size: 16px; font-weight: 400; transition: border-color .15s, box-shadow .15s; }
+input[type=password]:focus, input[type=text]:focus { outline: 0; border-color: var(--accent); box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 22%, transparent); }
 .err + form input[type=password] { border-color: var(--bad); }
 .btn { display: flex; align-items: center; justify-content: center; width: 100%; min-height: 42px; margin-top: 16px; padding: 8px 14px; border: 1px solid var(--accent); border-radius: var(--r-sm); background: var(--accent); color: var(--accent-ink); font-weight: 600; cursor: pointer; transition: background .15s, transform .15s var(--ease); }
 .btn:hover { background: color-mix(in srgb, var(--accent) 88%, var(--ink)); }
@@ -86,11 +86,11 @@ input[type=password]:focus { outline: 0; border-color: var(--accent); box-shadow
 <main class="card">
   <div class="brand"><span class="mark" aria-hidden="true"><svg viewBox="0 0 600 600"><use href="#glana-mark"/></svg></span><div class="brand-t"><b>Glana Pay</b><span>Base + bonus pay</span></div></div>
   <h1>Sign in</h1>
-  <p class="sub">Enter the team password to open the pay calculator.</p>
+  <p class="sub">Enter your login and password to open the pay calculator.</p>
   <!--ERROR-->
   <form method="post" action="/login" id="loginForm">
-    <input class="user" type="text" name="username" value="__USER__" autocomplete="username" tabindex="-1" aria-hidden="true" readonly>
-    <label>Password<input type="password" name="password" id="password" autocomplete="current-password" required autofocus></label>
+    <label>Login<input type="text" name="username" id="username" value="__USER__" autocomplete="username" autocapitalize="none" spellcheck="false" maxlength="32" placeholder="Owner: leave empty"></label>
+    <label style="margin-top:12px">Password<input type="password" name="password" id="password" autocomplete="current-password" required autofocus></label>
     <button class="btn" type="submit" id="signIn">Sign in</button>
   </form>
   <p class="note">Salaries are confidential. You stay signed in on this device for 7 days.</p>

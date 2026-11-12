@@ -127,7 +127,7 @@ const get = (url, headers) => fetch(url, { redirect: "manual", headers: headers 
     assert.strictEqual(r.headers.get("x-frame-options"), "DENY");
   });
   await t("status says Jira is connected", async () => {
-    assert.deepStrictEqual(await (await fetch(base + "/api/status", { headers: AUTH })).json(), { ok: true, jira: true, site: "glana.atlassian.net", db: null, hosted: false, auth: true, user: "glana", passwordChange: false, passwordChangedAt: null });
+    assert.deepStrictEqual(await (await fetch(base + "/api/status", { headers: AUTH })).json(), { ok: true, jira: true, site: "glana.atlassian.net", db: null, hosted: false, auth: true, user: "glana", passwordChange: false, passwordChangedAt: null, me: { id: "owner", name: "Owner", login: "glana", owner: true, admin: true, edit: true, pages: ["payroll", "tasks", "hours", "incidents", "team", "analytics"], seesPay: true } });
   });
 
   let pulled = [];
@@ -308,6 +308,148 @@ const get = (url, headers) => fetch(url, { redirect: "manual", headers: headers 
     assert.strictEqual((await signIn(b, "pw-123")).status, 429);
     s.close();
   });
+  // ---------- Settings → People: separate logins, who sees what ----------
+  await t("people: accounts with their own password, pages and edit rights", async () => {
+    const store = DB.MemoryStore({ "team/ani": { name: "Ani", salary: 900000, salaryHistory: [{ from: "2026-01", salary: 900000 }] }, "months/2026-11": { month: "2026-11", extras: { ani: { amount: 5 } }, final: { rows: [] }, hours: { ani: { worked: 1 } } } });
+    const s = createServer(configFromEnv({ APP_PASSWORD: "pw-123" }), { store }); const b = await listen(s);
+    const login = (u, p) => fetch(b + "/login", { method: "POST", redirect: "manual", headers: { "content-type": "application/x-www-form-urlencoded" }, body: new URLSearchParams({ username: u, password: p }).toString() });
+    const api = (cookie, method, p, body) => fetch(b + p, { method, headers: { cookie, "content-type": "application/json" }, body: body ? JSON.stringify(body) : undefined });
+    const owner = cookieOf(await login("", "pw-123"));
+    assert.strictEqual((await login("GLANA", "pw-123")).status, 303); // the owner's login also works, any case
+    // create: validation
+    for (const [body, re] of [[{ login: "x", password: "longenough" }, /login needs/], [{ login: "glana", password: "longenough" }, /owner/], [{ login: "sona", password: "short" }, /at least 8/], [{ login: "sona" }, /password/], [{ login: "sona", password: "longenough", pages: ["secrets"] }, /page/]]) {
+      const r = await api(owner, "POST", "/api/users", Object.assign({ action: "create" }, body)); assert.strictEqual(r.status, 400); assert.match((await r.json()).message, re);
+    }
+    let r = await api(owner, "POST", "/api/users", { action: "create", login: "Sona", name: "Sona", password: "sona-password", edit: true, pages: ["hours", "incidents"] });
+    assert.strictEqual(r.status, 200);
+    const sonaId = (await r.json()).users[0].id;
+    assert.strictEqual((await api(owner, "POST", "/api/users", { action: "create", login: "sona", password: "longenough" })).status, 400); // taken
+    r = await api(owner, "POST", "/api/users", { action: "create", login: "viewer", name: "Accountant", password: "viewer-password", pages: ["payroll", "analytics"] });
+    const viewId = (await r.json()).users.find((u) => u.login === "viewer").id;
+    // nothing secret in the list or in the stored record
+    const list = await (await api(owner, "GET", "/api/users")).json();
+    assert.ok(!/hash|salt|sona-password/.test(JSON.stringify(list)));
+    assert.ok(!JSON.stringify(await store.getAuth()).includes("sona-password"));
+    // sign in
+    assert.strictEqual((await login("sona", "wrong-password")).status, 401);
+    assert.match(await (await login("sona", "wrong-password")).text(), /Wrong login or password/);
+    assert.strictEqual((await login("nobody", "sona-password")).status, 401);
+    assert.strictEqual((await login("sona", "pw-123")).status, 401); // the owner's password doesn't open someone else's account
+    const sr = await login("SONA", "sona-password"); assert.strictEqual(sr.status, 303);
+    assert.match(sr.headers.get("set-cookie"), /^glana_session=u1\.[a-z0-9]+\.\d+\.[\w-]{43}; Path=\/; Max-Age=604800; HttpOnly; SameSite=Lax$/);
+    const sona = cookieOf(sr), viewer = cookieOf(await login("viewer", "viewer-password"));
+    const me = (await (await api(sona, "GET", "/api/status")).json()).me;
+    assert.deepStrictEqual(me, { id: sonaId, name: "Sona", login: "sona", owner: false, admin: false, edit: true, pages: ["hours", "incidents"], seesPay: false });
+    // Sona (hours + incidents, no pay pages): salaries and pay never reach her browser
+    const docs = (await (await api(sona, "GET", "/api/db")).json()).docs;
+    assert.deepStrictEqual(docs["team/ani"], { name: "Ani" });
+    assert.deepStrictEqual(docs["months/2026-11"], { month: "2026-11", hours: { ani: { worked: 1 } } });
+    assert.deepStrictEqual((await (await api(sona, "GET", "/api/db/doc?path=team/ani")).json()).data, { name: "Ani" });
+    const op = (cookie, o) => api(cookie, "POST", "/api/db", { ops: [o] });
+    r = await op(sona, { op: "update", path: "months/2026-11", data: { hours: { ani: { worked: 160 } } } });
+    assert.strictEqual(r.status, 200); assert.ok(!("extras" in (await r.json()).results[0].data));
+    assert.strictEqual((await op(sona, { op: "set", path: "months/2026-11/incidents/i1", data: { memberId: "ani", level: "minor", note: "late" } })).status, 200);
+    assert.strictEqual((await op(sona, { op: "set", path: "months/2026-12", data: { month: "2026-12" } })).status, 200); // a new month is fine
+    for (const o of [{ op: "update", path: "months/2026-11", data: { extras: { ani: { amount: 999999 } } } }, { op: "update", path: "months/2026-11", data: { jira: { parts: 0 } } }, { op: "set", path: "months/2026-11", data: { month: "2026-11" } }, { op: "delete", path: "months/2026-11" },
+      { op: "update", path: "team/ani", data: { salary: 1 } }, { op: "set", path: "config/settings", data: { basePct: 1 } }, { op: "set", path: "months/2026-11/jira/p0", data: { tasks: [] } }]) {
+      const x = await op(sona, o); assert.strictEqual(x.status, 403, JSON.stringify(o)); assert.strictEqual((await x.json()).code, "forbidden");
+    }
+    assert.strictEqual((await store.get("months/2026-11")).extras.ani.amount, 5);
+    assert.strictEqual((await store.get("team/ani")).salary, 900000);
+    // the viewer sees pay but can change nothing
+    assert.strictEqual((await (await api(viewer, "GET", "/api/db")).json()).docs["team/ani"].salary, 900000);
+    assert.strictEqual((await op(viewer, { op: "update", path: "months/2026-11", data: { hours: { ani: { worked: 2 } } } })).status, 403);
+    // admin-only doors
+    for (const c of [sona, viewer]) {
+      for (const [m, p2, body] of [["GET", "/api/users"], ["POST", "/api/users", { action: "create", login: "evil", password: "longenough", admin: true }], ["GET", "/api/history"], ["GET", "/api/backups"], ["POST", "/api/backups"], ["PUT", "/api/db", { docs: {} }]]) assert.strictEqual((await api(c, m, p2, body)).status, 403, p2);
+    }
+    assert.strictEqual((await api(viewer, "POST", "/api/jira/search", { from: "2026-11-01", to: "2026-12-01" })).status, 403);
+    // each person changes only their own password; the owner's stays
+    r = await fetch(b + "/api/password", { method: "POST", headers: { cookie: sona, "content-type": "application/json" }, body: JSON.stringify({ current: "sona-password", next: "sona-password-2" }) });
+    assert.strictEqual(r.status, 200); const sona2 = cookieOf(r);
+    assert.strictEqual((await api(sona, "GET", "/api/status")).status, 401);
+    assert.strictEqual((await api(sona2, "GET", "/api/status")).status, 200);
+    assert.strictEqual((await api(owner, "GET", "/api/status")).status, 200);
+    assert.strictEqual((await api(viewer, "GET", "/api/status")).status, 200);
+    assert.strictEqual((await login("sona", "sona-password")).status, 401);
+    // the owner changing their own password keeps the accounts
+    r = await fetch(b + "/api/password", { method: "POST", headers: { cookie: owner, "content-type": "application/json" }, body: JSON.stringify({ current: "pw-123", next: "owner-password-2" }) });
+    const owner2 = cookieOf(r);
+    assert.strictEqual((await api(sona2, "GET", "/api/status")).status, 200);
+    assert.strictEqual((await api(owner2, "GET", "/api/users")).status, 200);
+    // edit: give Sona the payroll page → she sees pay; lock → signed out at once; unlock; new password by the admin
+    r = await api(owner2, "POST", "/api/users", { action: "update", id: sonaId, pages: ["hours", "incidents", "payroll"] });
+    assert.strictEqual((await (await api(sona2, "GET", "/api/db")).json()).docs["team/ani"].salary, 900000);
+    await api(owner2, "POST", "/api/users", { action: "update", id: sonaId, locked: true });
+    assert.strictEqual((await api(sona2, "GET", "/api/status")).status, 401);
+    assert.strictEqual((await login("sona", "sona-password-2")).status, 401);
+    await api(owner2, "POST", "/api/users", { action: "update", id: sonaId, locked: false, password: "reset-by-admin" });
+    assert.strictEqual((await api(sona2, "GET", "/api/status")).status, 401); // old cookie: old password
+    const sona3 = cookieOf(await login("sona", "reset-by-admin"));
+    // an admin account can manage people, but not lock or remove itself
+    await api(owner2, "POST", "/api/users", { action: "update", id: sonaId, admin: true });
+    assert.strictEqual((await api(sona3, "GET", "/api/users")).status, 200);
+    for (const body of [{ action: "delete", id: sonaId }, { action: "update", id: sonaId, locked: true }, { action: "update", id: sonaId, admin: false }]) assert.strictEqual((await api(sona3, "POST", "/api/users", body)).status, 400);
+    // remove
+    assert.strictEqual((await api(owner2, "POST", "/api/users", { action: "delete", id: viewId })).status, 200);
+    assert.strictEqual((await api(viewer, "GET", "/api/status")).status, 401);
+    assert.strictEqual((await api(owner2, "POST", "/api/users", { action: "delete", id: "nope" })).status, 404);
+    // forged account cookies
+    const [, id, exp, sig] = sona3.split("=")[1].split(".");
+    for (const c of [`glana_session=u1.${id}.${Number(exp) + 1}.${sig}`, `glana_session=u1.${viewId}.${exp}.${sig}`, `glana_session=u1.${id}.${exp}.${"A".repeat(43)}`, `glana_session=v1.${exp}.${sig}`]) assert.strictEqual((await api(c, "GET", "/api/status")).status, 401, c);
+
+    // ---------- change history ----------
+    const h = (await (await api(owner2, "GET", "/api/history")).json()).entries;
+    const kinds = h.map((e) => e.kind);
+    for (const k of ["signin", "user", "doc", "password"]) assert.ok(kinds.includes(k), k);
+    const hours = h.find((e) => e.kind === "doc" && e.path === "months/2026-11" && e.who === "Sona");
+    assert.deepStrictEqual(hours.changes, [{ k: "hours.ani.worked", from: 1, to: 160 }]);
+    assert.ok(h.find((e) => e.kind === "user" && e.action === "locked" && e.login === "sona"));
+    assert.ok(h.find((e) => e.kind === "user" && e.action === "created" && e.who === "Owner"));
+    assert.ok(!/password-2|reset-by-admin|hash|salt/.test(JSON.stringify(h)));
+    assert.ok(h[0].at >= h[h.length - 1].at); // newest first
+    await op(owner2, { op: "update", path: "team/ani", data: { salary: 1000000 } });
+    await op(owner2, { op: "update", path: "team/ani", data: { salary: 1000000 } }); // no change → no entry
+    await op(owner2, { op: "delete", path: "months/2026-11/incidents/i1" });
+    const h2 = (await (await api(owner2, "GET", "/api/history?limit=3")).json()).entries;
+    assert.strictEqual(h2.length, 3);
+    assert.deepStrictEqual([h2[0].op, h2[0].path, h2[0].changes.find((c) => c.k === "note").from], ["delete", "months/2026-11/incidents/i1", "late"]);
+    assert.deepStrictEqual([h2[1].path, h2[1].label, h2[1].changes], ["team/ani", "Ani", [{ k: "salary", from: 900000, to: 1000000 }]]);
+    s.close();
+  });
+  await t("backups: weekly before the first change, before a restore, on request; the oldest are dropped", async () => {
+    const store = DB.MemoryStore({ "team/a": { name: "A" } });
+    const s = createServer(configFromEnv({ APP_PASSWORD: "pw-123" }), { store }); const b = await listen(s);
+    let cookie = AUTH.cookie;
+    const api = (method, p, body) => fetch(b + p, { method, headers: { cookie, "content-type": "application/json" }, body: body ? JSON.stringify(body) : undefined });
+    const jump = async (ms) => { Date.now = () => realNow() + ms; cookie = cookieOf(await signIn(b, "pw-123")); }; // cookies last 7 days: sign in again after the clock moves
+    assert.deepStrictEqual((await (await api("GET", "/api/backups")).json()).backups, []);
+    const realNow = Date.now;
+    try {
+      await api("POST", "/api/db", { ops: [{ op: "set", path: "team/b", data: { name: "B" } }] });
+      await api("POST", "/api/db", { ops: [{ op: "set", path: "team/c", data: { name: "C" } }] });
+      let l = (await (await api("GET", "/api/backups")).json()).backups;
+      assert.strictEqual(l.length, 1); assert.strictEqual(l[0].reason, "weekly"); assert.strictEqual(l[0].count, 1); // the state before the change
+      await jump(6 * 86400000);
+      await api("POST", "/api/db", { ops: [{ op: "set", path: "team/d", data: { name: "D" } }] });
+      assert.strictEqual((await (await api("GET", "/api/backups")).json()).backups.length, 1);
+      await jump(8 * 86400000);
+      await api("POST", "/api/db", { ops: [{ op: "set", path: "team/e", data: { name: "E" } }] });
+      l = (await (await api("GET", "/api/backups")).json()).backups;
+      assert.deepStrictEqual(l.map((x) => [x.reason, x.count]), [["weekly", 4], ["weekly", 1]]);
+      await jump(8 * 86400000 + 5000);
+      await api("PUT", "/api/db", { docs: { "team/z": { name: "Z" } } });
+      l = (await (await api("GET", "/api/backups")).json()).backups;
+      assert.deepStrictEqual([l[0].reason, l[0].count], ["before restore", 5]);
+      const full = await (await api("GET", "/api/backups/get?id=" + l[0].id)).json();
+      assert.strictEqual(full.app, "glana-pay"); assert.deepStrictEqual(Object.keys(full.docs).sort(), ["team/a", "team/b", "team/c", "team/d", "team/e"]);
+      assert.strictEqual((await api("GET", "/api/backups/get?id=nope")).status, 404);
+      for (let i = 0; i < 12; i++) { await jump(9 * 86400000 + i * 1000); assert.strictEqual((await api("POST", "/api/backups")).status, 200); }
+      l = (await (await api("GET", "/api/backups")).json()).backups;
+      assert.strictEqual(l.length, 10); assert.ok(l.every((x) => x.reason === "manual"));
+    } finally { Date.now = realNow; }
+    s.close();
+  });
   await t("password: without a database it can't be changed (clear 503)", async () => {
     const r = await changePw(base, AUTH.cookie, { current: "pw-123", next: "new-password-1" });
     assert.strictEqual(r.status, 503); assert.strictEqual((await r.json()).code, "no_database");
@@ -319,17 +461,33 @@ const get = (url, headers) => fetch(url, { redirect: "manual", headers: headers 
     const again = DB.FileStore(file);
     assert.deepStrictEqual((await again.all()).docs, { "team/a": { name: "A" }, "config/settings": { basePct: 80 } });
   });
-  await t("file db keeps the password record across restarts and restores", async () => {
-    const a = DB.FileStore(file); await a.putAuth({ v: 1, hash: "h" });
+  await t("file db keeps the password record, history and backups across restarts and restores", async () => {
+    const a = DB.FileStore(file); await a.putAuth({ v: 1, hash: "h" }); await a.addLog({ n: 1 }); await a.addLog({ n: 2 });
+    for (const i of [1, 2, 3]) await a.addBackup({ id: "b" + i, at: "2099-01-0" + i, reason: "weekly", docs: { "team/a": { name: "A" + i } } }, 2);
     await a.replaceAll({ "team/b": { name: "B" } });
-    assert.deepStrictEqual(await DB.FileStore(file).getAuth(), { v: 1, hash: "h" });
+    const again = DB.FileStore(file);
+    assert.deepStrictEqual(await again.getAuth(), { v: 1, hash: "h" });
+    assert.deepStrictEqual(await again.getLog(2), [{ n: 2 }, { n: 1 }]);
+    assert.deepStrictEqual((await again.listBackups()).map((x) => x.id), ["b3", "b2"]);
+    assert.deepStrictEqual((await again.getBackup("b3")).docs, { "team/a": { name: "A3" } });
+    assert.strictEqual(await again.getBackup("../db"), null);
   });
   fs.rmSync(tmp, { recursive: true, force: true });
 
   // fake Upstash REST API (just the commands store.js uses)
-  const hash = new Map(); const kv = new Map(); let rev = 0; const seen = [];
+  const hash = new Map(); const kv = new Map(); const list = []; let rev = 0; const seen = [];
   const run = (c) => {
     const [cmd, ...a] = c; seen.push(cmd);
+    if (cmd === "LPUSH") { list.unshift(a[1]); return list.length; }
+    if (cmd === "LTRIM") { list.length = Math.min(list.length, a[2] + 1); return "OK"; }
+    if (cmd === "LRANGE") return list.slice(a[1], a[2] + 1);
+    if (/:backup/.test(String(a[0]))) {
+      const hh = kv.get(a[0]) || new Map(); kv.set(a[0], hh);
+      if (cmd === "HSET") { hh.set(a[1], a[2]); return 1; }
+      if (cmd === "HGET") return hh.has(a[1]) ? hh.get(a[1]) : null;
+      if (cmd === "HGETALL") return [...hh].flat();
+      if (cmd === "HDEL") { let n = 0; for (const f of a.slice(1)) n += hh.delete(f) ? 1 : 0; return n; }
+    }
     if (cmd === "HGETALL") return [...hash].flat();
     if (cmd === "HGET") return hash.has(a[1]) ? hash.get(a[1]) : null;
     if (cmd === "HSET") { for (let i = 1; i < a.length; i += 2) hash.set(a[i], a[i + 1]); return 1; }
@@ -355,6 +513,15 @@ const get = (url, headers) => fetch(url, { redirect: "manual", headers: headers 
     const r = DB.RedisStore(upUrl, "up-token"); assert.strictEqual(await r.getAuth(), null);
     await r.putAuth({ v: 1, hash: "h" }); assert.deepStrictEqual(await r.getAuth(), { v: 1, hash: "h" });
     assert.ok(!(await r.all()).docs["auth"]);
+  });
+  await t("redis db keeps history and backups (in pieces)", async () => {
+    const r = DB.RedisStore(upUrl, "up-token");
+    await r.addLog({ n: 1 }); await r.addLog({ n: 2 }); assert.deepStrictEqual(await r.getLog(1), [{ n: 2 }]);
+    const big = { "team/a": { name: "x".repeat(800000) } };
+    for (const i of [1, 2, 3]) await r.addBackup({ id: "b" + i, at: "2099-01-0" + i, reason: "weekly", docs: i === 3 ? big : { "team/a": { name: "A" + i } } }, 2);
+    const l = await r.listBackups(); assert.deepStrictEqual(l.map((x) => [x.id, x.parts]), [["b3", 3], ["b2", 1]]);
+    assert.deepStrictEqual((await r.getBackup("b3")).docs, big); assert.strictEqual(await r.getBackup("b1"), null);
+    assert.deepStrictEqual([...kv.get("glanapay:backups").keys()].sort(), ["b2:0", "b3:0", "b3:1", "b3:2"]);
   });
   await t("redis db uses transactions for writes", () => assert.ok(seen.includes("INCR") && seen.includes("HGETALL")));
   await t("redis db: wrong token → clear error", async () => {

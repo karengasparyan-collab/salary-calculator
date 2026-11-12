@@ -97,38 +97,61 @@ const sha = (s) => crypto.createHash("sha256").update(String(s)).digest();
 
 // ---------- sign-in ----------
 // No sessions are kept on the server (Vercel starts a fresh copy of it whenever it likes). The cookie itself is the
-// proof: "v1.<expiry time>.<signature>", signed with a key made from the current password (+ SESSION_SECRET if set).
-// Nobody can forge or extend it without the key, and changing the password makes every old cookie invalid.
+// proof: an expiry time signed with a key made from that person's password (+ SESSION_SECRET if set).
+// Nobody can forge or extend it without the key, and changing a password makes that person's old cookies invalid.
 //
-// The password is APP_PASSWORD, until someone changes it in Settings. Then the database keeps a record
-// { v, salt, hash, envTag, changedAt }: the new password hashed with scrypt (never the password itself).
-// envTag ties the record to the APP_PASSWORD it replaced: if APP_PASSWORD is changed in Vercel later, the record is
-// ignored and APP_PASSWORD works again. That is the way back in when nobody remembers the new password.
+// There are two kinds of people:
+//   the owner   signs in with APP_PASSWORD (login: APP_USER, or left empty). Can do everything. If the owner changes
+//               the password in Settings, the database keeps { salt, hash, envTag, changedAt }: the new password
+//               hashed with scrypt. envTag ties it to the APP_PASSWORD it replaced: change APP_PASSWORD in Vercel
+//               and the stored one is ignored. That is the way back in when nobody remembers it.
+//   accounts    made by an admin in Settings → People: { login, name, salt, hash, admin, edit, pages, locked }.
+//               `pages` are the sections the person may open, `edit` whether they may change anything,
+//               `admin` gives everything (settings, people, history, backups). A locked account can't sign in.
+// Both live in one record beside the documents (store.getAuth): { v: 1, ...owner password, users: { id: account } }.
 const PW_MIN = 8, PW_MAX = 200;
+const PAGES = ["payroll", "tasks", "hours", "incidents", "team", "analytics"];
+const LOGIN_RE = /^[a-z0-9][a-z0-9._-]{1,31}$/;
 const envTag = (cfg) => crypto.createHmac("sha256", "glana-pay-env-tag").update(cfg.password).digest("hex");
 const scrypt = (pw, salt) => crypto.scryptSync(String(pw), Buffer.from(salt, "base64"), 32, { N: 16384, r: 8, p: 1 });
-function makeAuthRecord(cfg, pw, now) {
-  const salt = crypto.randomBytes(16).toString("base64");
-  return { v: 1, salt, hash: scrypt(pw, salt).toString("base64"), envTag: envTag(cfg), changedAt: new Date(now).toISOString() };
+function hashPassword(pw) { const salt = crypto.randomBytes(16).toString("base64"); return { salt, hash: scrypt(pw, salt).toString("base64") }; }
+function hashOk(given, rec) {
+  if (typeof given !== "string" || given.length > PW_MAX) return false;
+  const want = Buffer.from(rec.hash, "base64");
+  return want.length === 32 && crypto.timingSafeEqual(scrypt(given, rec.salt), want);
 }
-/** The stored record if it is in force (well-formed and made while today's APP_PASSWORD was set), else null. */
-function activeRecord(rec, cfg) {
-  return rec && rec.v === 1 && typeof rec.salt === "string" && typeof rec.hash === "string" && rec.envTag === envTag(cfg) ? rec : null;
+/** The owner's stored password if it is in force (made while today's APP_PASSWORD was set), else null. */
+function ownerRecord(auth, cfg) {
+  return auth && typeof auth.salt === "string" && typeof auth.hash === "string" && auth.envTag === envTag(cfg) ? auth : null;
 }
+const usersOf = (auth) => (auth && auth.users && typeof auth.users === "object" ? auth.users : {});
 function passwordOk(given, cfg, rec) {
   if (typeof given !== "string") return false;
-  if (rec) { const want = Buffer.from(rec.hash, "base64"); return given.length <= PW_MAX && want.length === 32 && crypto.timingSafeEqual(scrypt(given, rec.salt), want); }
-  return crypto.timingSafeEqual(sha(given), sha(cfg.password));
+  return rec ? hashOk(given, rec) : crypto.timingSafeEqual(sha(given), sha(cfg.password));
 }
 const sessionKey = (cfg, rec) => sha("glana-pay-session\n" + cfg.sessionSecret + "\n" + cfg.password + (rec ? "\n" + rec.hash : ""));
-const sign = (key, exp) => crypto.createHmac("sha256", key).update("v1." + exp).digest("base64url");
-function makeToken(key, now) { const exp = now + SESSION_MS; return `v1.${exp}.${sign(key, exp)}`; }
-function tokenOk(token, key, now) {
-  const m = /^v1\.(\d{1,16})\.([A-Za-z0-9_-]{43})$/.exec(token || "");
-  if (!m) return false;
-  const good = crypto.timingSafeEqual(Buffer.from(m[2]), Buffer.from(sign(key, Number(m[1]))));
-  return good && Number(m[1]) > now;
+const userKey = (cfg, id, u) => sha("glana-pay-user\n" + cfg.sessionSecret + "\n" + cfg.password + "\n" + id + "\n" + u.hash);
+const sign = (key, text) => crypto.createHmac("sha256", key).update(text).digest("base64url");
+/** Owner: "v1.<expiry>.<signature>". Account: "u1.<id>.<expiry>.<signature>". */
+function makeToken(key, now, uid) {
+  const exp = now + SESSION_MS;
+  return uid ? `u1.${uid}.${exp}.${sign(key, `u1.${uid}.${exp}`)}` : `v1.${exp}.${sign(key, "v1." + exp)}`;
 }
+const sameSig = (a, b) => a.length === b.length && crypto.timingSafeEqual(Buffer.from(a), Buffer.from(b));
+const ownerWho = (cfg, auth) => ({ id: "owner", owner: true, login: cfg.user, name: (auth && auth.ownerName) || "Owner", admin: true, edit: true, pages: PAGES.slice() });
+function userWho(id, u) { return { id, login: u.login, name: u.name || u.login, admin: !!u.admin, edit: !!(u.admin || u.edit), pages: u.admin ? PAGES.slice() : PAGES.filter((p) => (u.pages || []).includes(p)) }; }
+/** Who sent this cookie? Returns the person, or null (no cookie, forged, expired, account removed or locked). */
+function whoFromToken(token, cfg, auth, now) {
+  let m = /^v1\.(\d{1,16})\.([A-Za-z0-9_-]{43})$/.exec(token || "");
+  if (m) return sameSig(m[2], sign(sessionKey(cfg, ownerRecord(auth, cfg)), "v1." + m[1])) && Number(m[1]) > now ? ownerWho(cfg, auth) : null;
+  m = /^u1\.([a-z0-9]{6,20})\.(\d{1,16})\.([A-Za-z0-9_-]{43})$/.exec(token || "");
+  if (!m) return null;
+  const u = Object.prototype.hasOwnProperty.call(usersOf(auth), m[1]) ? usersOf(auth)[m[1]] : null;
+  if (!u || u.locked) return null;
+  return sameSig(m[3], sign(userKey(cfg, m[1], u), `u1.${m[1]}.${m[2]}`)) && Number(m[2]) > now ? userWho(m[1], u) : null;
+}
+/** May this person see salaries and pay? Only with the Payroll or Analytics page (or admin). */
+const seesPay = (who) => who.admin || who.pages.includes("payroll") || who.pages.includes("analytics");
 function readCookie(req, name) {
   for (const part of String(req.headers.cookie || "").split(";")) {
     const i = part.indexOf("=");
@@ -143,27 +166,53 @@ function cookieHeader(req, cfg, value, maxAgeSec) {
   return `${COOKIE}=${value}; Path=/; Max-Age=${maxAgeSec}; HttpOnly; SameSite=Lax${https ? "; Secure" : ""}`;
 }
 const escHtml = (t) => String(t).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
-function loginPage(cfg, error) {
+function loginPage(cfg, error, login) {
   return fs.readFileSync(path.join(ROOT, "login.html"), "utf8")
     .replace("<!--ERROR-->", error ? `<p class="err" id="loginError" role="alert">${escHtml(error)}</p>` : "")
-    .replace("__USER__", escHtml(cfg.user));
+    .replace("__USER__", escHtml(login || ""));
+}
+function checkNewPassword(next, current) {
+  if (typeof next !== "string") return "Send the new password.";
+  if (current != null && next === current) return "The new password is the same as the current one.";
+  if (next.length < PW_MIN) return `The new password needs at least ${PW_MIN} characters.`;
+  if (next.length > PW_MAX) return `The new password can have ${PW_MAX} characters at most.`;
+  if (!next.trim()) return "The new password can't be only spaces.";
+  return null;
 }
 /** Settings → Password: { current, next } as JSON. Returns { current, next } or { error }. */
 async function readPasswordChange(req) {
   const o = JSON.parse(await readBody(req, 4096));
   if (!o || typeof o.current !== "string" || typeof o.next !== "string") return { error: "Send the current and the new password." };
-  if (o.next === o.current) return { error: "The new password is the same as the current one." };
-  if (o.next.length < PW_MIN) return { error: `The new password needs at least ${PW_MIN} characters.` };
-  if (o.next.length > PW_MAX) return { error: `The new password can have ${PW_MAX} characters at most.` };
-  if (!o.next.trim()) return { error: "The new password can't be only spaces." };
-  return { current: o.current, next: o.next };
+  const error = checkNewPassword(o.next, o.current);
+  return error ? { error } : { current: o.current, next: o.next };
 }
-/** The password from the sign-in form (a normal form post; JSON is accepted too). */
-async function readPassword(req) {
+/** The login and password from the sign-in form (a normal form post; JSON is accepted too). */
+async function readLogin(req) {
   const text = await readBody(req, 4096);
-  if (text.trimStart().startsWith("{")) { const o = JSON.parse(text); return o && typeof o.password === "string" ? o.password : ""; }
-  return new URLSearchParams(text).get("password") || "";
+  const str = (v) => (typeof v === "string" ? v : "");
+  if (text.trimStart().startsWith("{")) { const o = JSON.parse(text) || {}; return { login: str(o.username).trim().toLowerCase(), password: str(o.password) }; }
+  const q = new URLSearchParams(text);
+  return { login: (q.get("username") || "").trim().toLowerCase(), password: q.get("password") || "" };
 }
+/** Settings → People: check one account's fields. Returns the clean fields or { error }. */
+function cleanUser(o, auth, cfg, id) {
+  const out = {};
+  if (o.login !== undefined) {
+    const login = String(o.login).trim().toLowerCase();
+    if (!LOGIN_RE.test(login)) return { error: "The login needs 2 to 32 letters, digits, dots, dashes or underscores." };
+    if (login === String(cfg.user).toLowerCase()) return { error: "That login belongs to the owner." };
+    for (const [k, u] of Object.entries(usersOf(auth))) if (k !== id && u.login === login) return { error: "That login is already used." };
+    out.login = login;
+  }
+  if (o.name !== undefined) { out.name = String(o.name).trim().slice(0, 80); if (!out.name) return { error: "Enter a name." }; }
+  if (o.password !== undefined && o.password !== "") { const e = checkNewPassword(o.password, null); if (e) return { error: e.replace("new password", "password") }; Object.assign(out, hashPassword(o.password)); }
+  if (o.admin !== undefined) out.admin = !!o.admin;
+  if (o.edit !== undefined) out.edit = !!o.edit;
+  if (o.locked !== undefined) out.locked = !!o.locked;
+  if (o.pages !== undefined) { if (!Array.isArray(o.pages) || !o.pages.every((p) => PAGES.includes(p))) return { error: "Unknown page." }; out.pages = PAGES.filter((p) => o.pages.includes(p)); }
+  return out;
+}
+const publicUser = (id, u) => ({ id, login: u.login, name: u.name, admin: !!u.admin, edit: !!(u.admin || u.edit), pages: u.admin ? PAGES.slice() : (u.pages || []), locked: !!u.locked, createdAt: u.createdAt || null, passwordAt: u.passwordAt || null });
 
 // ---------- Jira ----------
 /** Validate the browser's request and build the JQL on the server. Returns { jql, maxResults, nextPageToken } or { error }. */
@@ -236,32 +285,98 @@ async function searchJira(cfg, search, fetchImpl) {
 }
 
 // ---------- shared data ----------
-async function handleDb(req, res, url, store) {
+/** Without the Payroll or Analytics page, salaries and pay never leave the server. */
+function strip(p, data, who) {
+  if (!data || seesPay(who)) return data;
+  if (p.startsWith("team/")) { const o = Object.assign({}, data); delete o.salary; delete o.salaryHistory; return o; }
+  if (/^months\/\d{4}-\d{2}$/.test(p)) { const o = Object.assign({}, data); delete o.extras; delete o.final; return o; }
+  return data;
+}
+const MONTH_KEYS = { hours: "hours", hoursImport: "hours", skipHours: "hours", jira: "tasks", extras: "payroll", final: "payroll" };
+/** May this person make this change? Returns null (yes) or the reason (no). `prev` is the stored document. */
+function denyWrite(who, op, prev) {
+  if (!who.edit) return "Your account can view the calculator but not change it.";
+  if (who.admin) return null;
+  const p = op.path, has = (page) => who.pages.includes(page);
+  if (p === "config/settings") return "Only an admin can change the settings.";
+  if (p === "debug/lastPull") return null;
+  if (p.startsWith("team/")) return has("team") && seesPay(who) ? null : "Your account can't change the team.";
+  const m = /^months\/\d{4}-\d{2}\/(incidents|jira)\//.exec(p);
+  if (m) return has(m[1] === "jira" ? "tasks" : "incidents") ? null : `Your account can't change ${m[1] === "jira" ? "the Jira tasks" : "incidents"}.`;
+  if (op.op === "delete") return "Only an admin can delete a month.";
+  if (op.op === "set" && prev) return "Only an admin can replace a month.";
+  for (const k of Object.keys(op.data || {})) if (MONTH_KEYS[k] && !has(MONTH_KEYS[k])) return `Your account can't change the ${MONTH_KEYS[k] === "tasks" ? "Jira tasks" : MONTH_KEYS[k]}.`;
+  return null;
+}
+// ----- change history -----
+const isObj = (v) => v && typeof v === "object" && !Array.isArray(v);
+const LEAF = new Set(["final", "jira", "hoursImport", "salaryHistory", "holidays", "bands", "gates", "shadowMonths", "issueTypes"]);
+function brief(k, v) {
+  if (v === undefined) return null;
+  if (v === null || typeof v !== "object") return typeof v === "string" && v.length > 160 ? v.slice(0, 160) + "…" : v;
+  if (k === "jira") return { tasks: v.rowCount, source: v.source || "csv" };
+  if (k === "final") return { people: Array.isArray(v.rows) ? v.rows.length : 0 };
+  if (k === "hoursImport") return { file: v.fileName };
+  return JSON.stringify(v).length <= 400 ? v : Array.isArray(v) ? { items: v.length } : { fields: Object.keys(v).length };
+}
+/** What changed between two versions of a document: [{ k: "hours.ani.worked", from, to }] (at most 40). */
+function diff(a, b, prefix, out, depth) {
+  out = out || []; depth = depth || 0;
+  for (const k of [...new Set(Object.keys(a || {}).concat(Object.keys(b || {})))].sort()) {
+    if (out.length >= 40) break;
+    const av = a ? a[k] : undefined, bv = b ? b[k] : undefined;
+    if (JSON.stringify(av) === JSON.stringify(bv)) continue;
+    if ((av == null || av === "") && (bv == null || bv === "")) continue; // "" and nothing are the same to a reader
+    if (!LEAF.has(k) && depth < 3 && (isObj(av) || isObj(bv)) && (isObj(av) || av == null) && (isObj(bv) || bv == null)) diff(av || {}, bv || {}, (prefix || "") + k + ".", out, depth + 1);
+    else out.push({ k: (prefix || "") + k, from: brief(k, av), to: brief(k, bv) });
+  }
+  return out;
+}
+async function handleDb(req, res, url, store, who, hooks) {
   if (!store) return send(res, 503, { code: "no_database", message: "The shared database isn't connected." });
+  const forbid = (message) => send(res, 403, { code: "forbidden", message });
   try {
     if (req.method === "GET" && url.pathname === "/api/db") {
       const since = url.searchParams.get("since");
       if (since != null && Number(since) === (await store.rev())) return send(res, 200, { unchanged: true, rev: Number(since) });
-      return send(res, 200, await store.all());
+      const all = await store.all();
+      if (!seesPay(who)) for (const k of Object.keys(all.docs)) all.docs[k] = strip(k, all.docs[k], who);
+      return send(res, 200, all);
     }
     if (req.method === "GET" && url.pathname === "/api/db/doc") {
       const p = url.searchParams.get("path");
       if (!DB.validPath(p)) return send(res, 400, { code: "invalid_argument", message: "Unknown document path." });
-      return send(res, 200, { path: p, data: await store.get(p) });
+      return send(res, 200, { path: p, data: strip(p, await store.get(p), who) });
     }
     if (req.method === "POST" && url.pathname === "/api/db") {
       const body = JSON.parse(await readBody(req, 3 * 1024 * 1024));
       const ops = Array.isArray(body && body.ops) ? body.ops : [];
       if (!ops.length || ops.length > 50) return send(res, 400, { code: "invalid_argument", message: "Send 1 to 50 changes." });
+      const before = [];
+      for (const op of ops) {
+        if (!op || !DB.validPath(op.path)) return send(res, 400, { code: "invalid_argument", message: "Unknown document path." });
+        const prev = await store.get(op.path); before.push(prev);
+        const no = denyWrite(who, op, prev); if (no) return forbid(no);
+      }
+      await hooks.beforeWrite();
       const results = [];
-      for (const op of ops) results.push(await DB.applyOp(store, op));
+      for (let i = 0; i < ops.length; i++) {
+        const r = await DB.applyOp(store, ops[i]);
+        results.push({ path: r.path, data: strip(r.path, r.data, who) });
+        if (/\/jira\/|^debug\//.test(r.path)) continue; // the tasks themselves are not history; "jira" on the month says what was pulled
+        const changes = diff(before[i] || {}, r.data || {});
+        if (changes.length) await hooks.log(who, "doc", { op: before[i] ? ops[i].op : "create", path: r.path, label: (r.data && r.data.name) || (before[i] && before[i].name) || undefined, changes });
+      }
       return send(res, 200, { results, rev: await store.rev() });
     }
     if (req.method === "PUT" && url.pathname === "/api/db") {
+      if (!who.admin) return forbid("Only an admin can restore a backup.");
       const body = JSON.parse(await readBody(req, 4 * 1024 * 1024));
       const bad = DB.checkAll(body && body.docs);
       if (bad) return send(res, 400, { code: "invalid_argument", message: bad });
+      await hooks.beforeRestore();
       await store.replaceAll(body.docs);
+      await hooks.log(who, "restore", { count: Object.keys(body.docs).length });
       return send(res, 200, await store.all());
     }
     return send(res, 405, { code: "bad_request", message: "Not allowed." });
@@ -274,9 +389,14 @@ async function handleDb(req, res, url, store) {
 }
 
 // ---------- server ----------
-function statusBody(cfg, store, canChange, rec) {
+const BACKUP_KEEP = 10, WEEK_MS = 7 * 86400000;
+function statusBody(cfg, store, canChange, auth, who) {
   const out = { ok: true, jira: !!(cfg.jiraEmail && cfg.jiraToken), site: cfg.jiraSite, db: store ? store.kind : null, hosted: !!cfg.hosted, auth: !!cfg.password };
-  if (cfg.password) Object.assign(out, { user: cfg.user, passwordChange: canChange, passwordChangedAt: rec ? rec.changedAt : null });
+  if (cfg.password) {
+    const rec = who.owner ? ownerRecord(auth, cfg) : null, u = who.owner ? null : usersOf(auth)[who.id];
+    Object.assign(out, { user: who.login, passwordChange: canChange, passwordChangedAt: rec ? rec.changedAt : (u && u.passwordAt) || null });
+    out.me = { id: who.id, name: who.name, login: who.login, owner: !!who.owner, admin: who.admin, edit: who.edit, pages: who.pages, seesPay: seesPay(who) };
+  }
   return out;
 }
 /** The request handler, shared by the Node server below and Vercel (api/index.js).
@@ -287,19 +407,103 @@ function createHandler(cfg, opts) {
   const store = opts.store || null;
   const fails = new Map(); // ip -> [timestamps] of wrong passwords
   const canChange = !!(store && store.getAuth && store.putAuth);
-  // The stored password is read again at most every few seconds. On Vercel other running copies of the server
+  // The sign-in record is read again at most every few seconds. On Vercel other running copies of the server
   // therefore notice a change within AUTH_TTL_MS; the copy that made the change knows at once.
   const AUTH_TTL_MS = 5000;
-  let authCache = { at: -Infinity, rec: null };
+  let authCache = { at: -Infinity, auth: null };
   async function authRecord(now) {
     if (!canChange || !cfg.password) return null;
-    if (now - authCache.at < AUTH_TTL_MS) return authCache.rec;
-    try { authCache = { at: now, rec: activeRecord(await store.getAuth(), cfg) }; }
+    if (now - authCache.at < AUTH_TTL_MS) return authCache.auth;
+    try { authCache = { at: now, auth: await store.getAuth() }; }
     catch (e) { if (authCache.at === -Infinity) throw e; } // database down: keep using what we last knew
-    return authCache.rec;
+    return authCache.auth;
   }
+  async function saveAuth(auth, now) { await store.putAuth(auth); authCache = { at: now, auth }; }
   const tooMany = (ip, now) => (fails.get(ip) || []).filter((t) => now - t < LOCK_MS).length >= MAX_FAILS;
   const failed = (ip, now) => { const r = (fails.get(ip) || []).filter((t) => now - t < LOCK_MS); r.push(now); fails.set(ip, r); return MAX_FAILS - r.length; };
+  /** Change history: who did what. A failure here never blocks the change itself. */
+  async function log(who, kind, data) {
+    if (!store || !store.addLog) return;
+    try { await store.addLog(Object.assign({ at: new Date().toISOString(), who: who.name, whoId: who.id, kind }, data)); } catch (e) { console.error("history:", e && e.message); }
+  }
+  // Backups kept on the server: one before the first change of each week, one before every restore, and on request.
+  let lastBackup = null, lastLooked = -Infinity;
+  async function backupNow(reason, now) {
+    const all = await store.all();
+    if (!Object.keys(all.docs).length) return null;
+    const at = new Date(now).toISOString();
+    const b = { id: at.replace(/\D/g, "").slice(0, 14) + "-" + crypto.randomBytes(3).toString("hex"), at, reason, docs: all.docs };
+    await store.addBackup(b, BACKUP_KEEP); lastBackup = now;
+    return b;
+  }
+  async function weeklyBackup(now) {
+    if (!store || !store.addBackup) return;
+    try {
+      if (lastBackup == null || now - lastLooked > 3600000) { const l = await store.listBackups(); lastBackup = l.length ? Date.parse(l[0].at) : 0; lastLooked = now; }
+      if (now - lastBackup >= WEEK_MS) await backupNow("weekly", now);
+    } catch (e) { console.error("backup:", e && e.message); }
+  }
+  const hooks = (now) => ({ log, beforeWrite: () => weeklyBackup(now), beforeRestore: async () => { if (store.addBackup) { try { await backupNow("before restore", now); } catch (e) { console.error("backup:", e && e.message); } } } });
+  const json = async (req, limit) => { const o = JSON.parse(await readBody(req, limit)); if (!o || typeof o !== "object") throw new SyntaxError("not an object"); return o; };
+
+  /** Settings → People (admins only). */
+  async function handleUsers(req, res, who, auth, now) {
+    if (!who.admin) return send(res, 403, { code: "forbidden", message: "Only an admin can manage people." });
+    if (!canChange) return send(res, 503, { code: "no_database", message: "Separate logins need the shared database." });
+    const list = () => Object.entries(usersOf(authCache.auth)).map(([id, u]) => publicUser(id, u)).sort((a, b) => a.name.localeCompare(b.name));
+    if (req.method === "GET") return send(res, 200, { users: list(), owner: { login: cfg.user }, pages: PAGES });
+    if (req.method !== "POST") return send(res, 405, { code: "bad_request", message: "Not allowed." });
+    let o; try { o = await json(req, 8192); } catch (e) { return send(res, 400, { code: "bad_request", message: "Send a small JSON body." }); }
+    const next = Object.assign({ v: 1 }, auth || {}); next.users = Object.assign({}, usersOf(auth));
+    const bad = (message) => send(res, 400, { code: "invalid_argument", message });
+    if (o.action === "create") {
+      if (Object.keys(next.users).length >= 50) return bad("50 accounts at most.");
+      if (!o.password) return bad("Enter a password.");
+      const f = cleanUser({ login: o.login, name: o.name || o.login, password: o.password, admin: o.admin, edit: o.edit, pages: o.pages || [] }, auth, cfg, null);
+      if (f.error) return bad(f.error);
+      const id = crypto.randomBytes(6).toString("hex");
+      next.users[id] = Object.assign({ admin: false, edit: false, pages: [], locked: false }, f, { createdAt: new Date(now).toISOString(), passwordAt: new Date(now).toISOString() });
+      await saveAuth(next, now);
+      await log(who, "user", { action: "created", login: f.login, label: f.name });
+    } else if (o.action === "update" || o.action === "delete") {
+      const u = Object.prototype.hasOwnProperty.call(next.users, o.id) ? next.users[o.id] : null;
+      if (!u) return send(res, 404, { code: "invalid_argument", message: "No such account." });
+      if (o.id === who.id && (o.action === "delete" || o.locked || o.admin === false)) return bad("You can't lock, remove or demote your own account.");
+      if (o.action === "delete") { delete next.users[o.id]; await saveAuth(next, now); await log(who, "user", { action: "removed", login: u.login, label: u.name }); }
+      else {
+        const f = cleanUser({ login: o.login, name: o.name, password: o.password, admin: o.admin, edit: o.edit, pages: o.pages, locked: o.locked }, auth, cfg, o.id);
+        if (f.error) return bad(f.error);
+        if (f.hash) f.passwordAt = new Date(now).toISOString();
+        const was = publicUser(o.id, u);
+        next.users[o.id] = Object.assign({}, u, f);
+        await saveAuth(next, now);
+        const is = publicUser(o.id, next.users[o.id]);
+        const changes = diff(was, is).filter((c) => c.k !== "passwordAt");
+        if (f.hash) changes.push({ k: "password", from: null, to: "changed" });
+        if (changes.length) await log(who, "user", { action: f.locked === true && !was.locked ? "locked" : f.locked === false && was.locked ? "unlocked" : "changed", login: is.login, label: is.name, changes });
+      }
+    } else return bad("Unknown action.");
+    return send(res, 200, { ok: true, users: list() });
+  }
+  /** Settings → Backup (admins only): list, download one, make one now. */
+  async function handleBackups(req, res, url, who, now) {
+    if (!who.admin) return send(res, 403, { code: "forbidden", message: "Only an admin can use backups." });
+    if (!store || !store.addBackup) return send(res, 503, { code: "no_database", message: "Server backups need the shared database." });
+    if (req.method === "GET" && url.pathname === "/api/backups") return send(res, 200, { backups: await store.listBackups(), keep: BACKUP_KEEP });
+    if (req.method === "GET" && url.pathname === "/api/backups/get") {
+      const b = await store.getBackup(String(url.searchParams.get("id") || ""));
+      if (!b) return send(res, 404, { code: "invalid_argument", message: "No such backup." });
+      return send(res, 200, { app: "glana-pay", version: 1, exportedAt: b.at, reason: b.reason, docs: b.docs });
+    }
+    if (req.method === "POST" && url.pathname === "/api/backups") {
+      const b = await backupNow("manual", now);
+      if (!b) return send(res, 400, { code: "invalid_argument", message: "There is nothing to back up yet." });
+      await log(who, "backup", { id: b.id });
+      return send(res, 200, { ok: true, backups: await store.listBackups(), keep: BACKUP_KEEP });
+    }
+    return send(res, 405, { code: "bad_request", message: "Not allowed." });
+  }
+
   return async (req, res) => {
     try {
       const url = new URL(req.url, "http://x");
@@ -310,16 +514,17 @@ function createHandler(cfg, opts) {
       }
       const isApi = url.pathname.startsWith("/api/");
       const html = { "Content-Type": "text/html; charset=utf-8" };
+      const now = Date.now();
+      let who = { id: "local", owner: true, login: "", name: "This computer", admin: true, edit: true, pages: PAGES.slice() }, auth = null;
       if (!cfg.password) {
         // Only possible on this computer (see the bottom of this file): no sign-in, so no sign-in page either.
         if (url.pathname === "/login" || url.pathname === "/logout") return send(res, 303, "", { Location: "/" });
       } else {
-        const now = Date.now();
-        let rec;
-        try { rec = await authRecord(now); }
+        try { auth = await authRecord(now); }
         catch (e) { return send(res, 503, isApi ? { code: "unavailable", message: "The database didn't answer. Try again in a minute." } : "The database didn't answer. Try again in a minute.", isApi ? {} : { "Content-Type": "text/plain; charset=utf-8" }); }
-        const key = sessionKey(cfg, rec);
-        const signedIn = tokenOk(readCookie(req, COOKIE), key, now);
+        const rec = ownerRecord(auth, cfg);
+        who = whoFromToken(readCookie(req, COOKIE), cfg, auth, now);
+        const signedIn = !!who;
         if (url.pathname === "/logout") {
           if (req.method !== "POST") return send(res, 303, "", { Location: signedIn ? "/" : "/login" });
           return send(res, 303, "", { Location: "/login", "Set-Cookie": cookieHeader(req, cfg, "", 0) });
@@ -328,14 +533,21 @@ function createHandler(cfg, opts) {
           if (req.method === "GET") return signedIn ? send(res, 303, "", { Location: "/" }) : send(res, 200, loginPage(cfg, ""), html);
           if (req.method !== "POST") return send(res, 405, "Not allowed.", { "Content-Type": "text/plain; charset=utf-8" });
           if (tooMany(ip, now)) return send(res, 429, loginPage(cfg, "Too many wrong passwords. Try again in 15 minutes."), html);
-          let given = "";
-          try { given = await readPassword(req); } catch (e) { return send(res, 400, loginPage(cfg, "That didn't work. Please try again."), html); }
-          if (!passwordOk(given, cfg, rec)) {
+          let given;
+          try { given = await readLogin(req); } catch (e) { return send(res, 400, loginPage(cfg, "That didn't work. Please try again."), html); }
+          // An empty login (or the owner's) is the owner; anything else must be an account made in Settings → People.
+          const isOwner = !given.login || given.login === String(cfg.user).toLowerCase();
+          const hit = isOwner ? null : Object.entries(usersOf(auth)).find(([, u]) => u.login === given.login);
+          const ok = isOwner ? passwordOk(given.password, cfg, rec) : !!hit && !hit[1].locked && hashOk(given.password, hit[1]);
+          if (!ok) {
             const left = failed(ip, now);
-            return send(res, 401, loginPage(cfg, left > 0 ? "Wrong password. Please try again." : "Too many wrong passwords. Try again in 15 minutes."), html);
+            return send(res, 401, loginPage(cfg, left <= 0 ? "Too many wrong passwords. Try again in 15 minutes." : isOwner ? "Wrong password. Please try again." : "Wrong login or password. Please try again.", isOwner ? "" : given.login), html);
           }
           fails.delete(ip);
-          return send(res, 303, "", { Location: "/", "Set-Cookie": cookieHeader(req, cfg, makeToken(key, now), SESSION_MS / 1000) });
+          const me = isOwner ? ownerWho(cfg, auth) : userWho(hit[0], hit[1]);
+          await log(me, "signin", {});
+          const token = isOwner ? makeToken(sessionKey(cfg, rec), now) : makeToken(userKey(cfg, hit[0], hit[1]), now, hit[0]);
+          return send(res, 303, "", { Location: "/", "Set-Cookie": cookieHeader(req, cfg, token, SESSION_MS / 1000) });
         }
         if (!signedIn) {
           if (isApi) return send(res, 401, { code: "login_required", message: "Sign in first." });
@@ -348,24 +560,36 @@ function createHandler(cfg, opts) {
           let ch;
           try { ch = await readPasswordChange(req); } catch (e) { return send(res, 400, { code: "bad_request", message: "Send a small JSON body." }); }
           if (ch.error) return send(res, 400, { code: "invalid_argument", message: ch.error });
-          if (!passwordOk(ch.current, cfg, rec)) {
+          const mine = who.owner ? null : usersOf(auth)[who.id];
+          if (!(who.owner ? passwordOk(ch.current, cfg, rec) : hashOk(ch.current, mine))) {
             const left = failed(ip, now);
             return send(res, left > 0 ? 403 : 429, { code: "wrong_password", message: left > 0 ? "The current password is wrong." : "Too many wrong passwords. Try again in 15 minutes." });
           }
-          const next = makeAuthRecord(cfg, ch.next, now);
-          await store.putAuth(next);
-          authCache = { at: now, rec: next };
-          // Everyone else is signed out (their cookies were signed with the old key). This browser stays signed in.
-          return send(res, 200, { ok: true, changedAt: next.changedAt }, { "Set-Cookie": cookieHeader(req, cfg, makeToken(sessionKey(cfg, next), now), SESSION_MS / 1000) });
+          const changedAt = new Date(now).toISOString();
+          const next = Object.assign({ v: 1 }, auth || {});
+          let token;
+          if (who.owner) { Object.assign(next, hashPassword(ch.next), { envTag: envTag(cfg), changedAt }); token = makeToken(sessionKey(cfg, next), now); }
+          else { next.users = Object.assign({}, usersOf(auth)); next.users[who.id] = Object.assign({}, mine, hashPassword(ch.next), { passwordAt: changedAt }); token = makeToken(userKey(cfg, who.id, next.users[who.id]), now, who.id); }
+          await saveAuth(next, now);
+          await log(who, "password", {});
+          // This person's other browsers are signed out (their cookies were signed with the old key). This one stays in.
+          return send(res, 200, { ok: true, changedAt }, { "Set-Cookie": cookieHeader(req, cfg, token, SESSION_MS / 1000) });
         }
-        if (url.pathname === "/api/status" && req.method === "GET") {
-          return send(res, 200, statusBody(cfg, store, canChange, rec));
-        }
+        if (url.pathname === "/api/users") return await handleUsers(req, res, who, auth, now);
       }
-      if (req.method === "GET" && url.pathname === "/api/status") return send(res, 200, statusBody(cfg, store, canChange, null));
-      if (url.pathname === "/api/db" || url.pathname === "/api/db/doc") return await handleDb(req, res, url, store);
+      if (req.method === "GET" && url.pathname === "/api/status") return send(res, 200, statusBody(cfg, store, canChange, auth, who));
+      if (url.pathname === "/api/db" || url.pathname === "/api/db/doc") return await handleDb(req, res, url, store, who, hooks(now));
+      if (url.pathname === "/api/history") {
+        if (req.method !== "GET") return send(res, 405, { code: "bad_request", message: "Use GET." });
+        if (!who.admin) return send(res, 403, { code: "forbidden", message: "Only an admin can read the change history." });
+        if (!store || !store.getLog) return send(res, 503, { code: "no_database", message: "The change history needs the shared database." });
+        const limit = Math.max(1, Math.min(1000, Math.floor(Number(url.searchParams.get("limit")) || 300)));
+        return send(res, 200, { entries: await store.getLog(limit) });
+      }
+      if (url.pathname === "/api/backups" || url.pathname === "/api/backups/get") return await handleBackups(req, res, url, who, now);
       if (url.pathname === "/api/jira/search") {
         if (req.method !== "POST") return send(res, 405, { code: "bad_request", message: "Use POST." });
+        if (!who.admin && !(who.edit && who.pages.includes("tasks"))) return send(res, 403, { code: "forbidden", message: "Your account can't pull from Jira." });
         if (!cfg.jiraEmail || !cfg.jiraToken) return send(res, 503, { code: "not_configured", message: "Set JIRA_EMAIL and JIRA_API_TOKEN on the server." });
         let body;
         try { body = JSON.parse(await readBody(req, 16 * 1024)); } catch (e) { return send(res, e && e.status === 413 ? 413 : 400, { code: "bad_request", message: "Send a small JSON body." }); }
@@ -404,4 +628,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { createServer, createHandler, configFromEnv, buildSearch, slimIssue, searchJira };
+module.exports = { createServer, createHandler, configFromEnv, buildSearch, slimIssue, searchJira, diff, PAGES };
