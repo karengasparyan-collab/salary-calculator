@@ -23,6 +23,10 @@
     penalties: { minor: 10, major: 50 },  // % of bonus; critical = 100%
     issueTypes: ["Task", "Subtask", "Sub-task", "Bug"],
     excludeLabel: "cancelled",
+    // Blocked tasks: Jira pushes the due date back by the working days spent in Blocked (field "Blocked days"),
+    // so timing is already fair. Flag a person for review when, in the pay month, they had at least `tasks`
+    // blocked tasks or `days` blocked working days in total.
+    blockedFlag: { tasks: 3, days: 10 },
     shadowMonths: ["2026-12", "2027-01"],
     jiraSite: "99b8e946-94d7-4938-96a7-e73559c4816a",   // glana.atlassian.net
     jiraProjects: "GOD, PRJ, AWE",
@@ -160,6 +164,7 @@
     started: ["custom field (started)", "started"],
     rejections: ["custom field (rejections)", "rejections"],
     reopened: ["custom field (reopened)", "reopened"],
+    blockedDays: ["custom field (blocked days)", "blocked days"],
   };
   const REQUIRED = ["key", "assignee", "resolved", "due", "submitted", "rejections", "reopened"];
   function mapColumns(header) {
@@ -205,6 +210,7 @@
         started: parseDate(g("started")),
         rejections: num(g("rejections")),
         reopened: num(g("reopened")),
+        blockedDays: num(g("blockedDays")),
         labels: map.labels.map((i) => (r[i] || "").trim()).filter(Boolean),
       };
       for (const k of ["resolved", "due", "submitted"]) if (g(k) && !t[k]) badDates++;
@@ -239,6 +245,7 @@
       started: parseDate(custom("Started", "customfield_10201")),
       rejections: num(custom("Rejections", "customfield_10198")),
       reopened: num(custom("Reopened", "customfield_10199")),
+      blockedDays: num(custom("Blocked days", "customfield_10204")),
       labels: Array.isArray(f.labels) ? f.labels.slice() : [],
     };
   }
@@ -263,7 +270,7 @@
     const mid = addDays(from, Math.floor(days / 2));
     return [[from, mid], [mid, to]];
   }
-  const JIRA_FIELDS = ["summary", "issuetype", "status", "priority", "assignee", "created", "resolutiondate", "duedate", "labels", "customfield_10198", "customfield_10199", "customfield_10200", "customfield_10201"];
+  const JIRA_FIELDS = ["summary", "issuetype", "status", "priority", "assignee", "created", "resolutiondate", "duedate", "labels", "customfield_10198", "customfield_10199", "customfield_10200", "customfield_10201", "customfield_10204"];
 
   // ---------- scoring ----------
   function timingPoints(late, cfg) {
@@ -405,6 +412,13 @@
       if (scoreBasis === "pool") warnings.push(`Quiet month (${inMonth.length} task${inMonth.length === 1 ? "" : "s"}): scored on ${pool.length} tasks from the last ${cfg.poolMonths} months`);
     }
 
+    // --- blocked (deadline already pushed back in Jira; this only flags heavy use for review) ---
+    const bf = Object.assign({}, DEFAULT_SETTINGS.blockedFlag, cfg.blockedFlag || {});
+    const blockedTasks = inMonth.filter((t) => (t.blockedDays || 0) > 0).length;
+    const blockedDays = inMonth.reduce((a, t) => a + (t.blockedDays || 0), 0);
+    const blockedFlagged = (bf.tasks > 0 && blockedTasks >= bf.tasks) || (bf.days > 0 && blockedDays >= bf.days);
+    if (blockedFlagged) warnings.push(`Blocked often: ${blockedTasks} task${blockedTasks === 1 ? "" : "s"}, ${blockedDays} working day${blockedDays === 1 ? "" : "s"} in Blocked. Check the reasons in Jira.`);
+
     // --- ethics ---
     const ethics = ethicsFor(input.incidents, cfg);
 
@@ -423,6 +437,7 @@
       salary, base, basePaid, prorate, monthDays, employedDays, paidDays,
       requiredDays, requiredHours, worked, leave, sick, unpaid, attendancePct, gate, hoursMissing, hoursSkipped,
       tasks: inMonth, tasksUsed: used.length, poolCount: pool.length, scoreBasis, score, band, bonusPct,
+      blockedTasks, blockedDays, blockedFlagged,
       ethics, bonus, extra, extraNote, total, shadow, currentPaid, diff: total - currentPaid, tax,
       warnings: warnings.concat(ethics.flags),
     };

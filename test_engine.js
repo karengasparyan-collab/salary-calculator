@@ -219,5 +219,31 @@ t("tax: off by default, Armenian rules when on", () => {
   assert.strictEqual(sh.shadow, true); assert.strictEqual(sh.tax.gross, sh.currentPaid);
 });
 
+// ---------- blocked ----------
+t("blocked days read from Jira API and CSV", () => {
+  assert.strictEqual(E.taskFromJiraApi({ key: "A-1", fields: { customfield_10204: 3 } }).blockedDays, 3);
+  assert.strictEqual(E.taskFromJiraApi({ key: "A-1", fields: {} }).blockedDays, 0);
+  assert.ok(E.JIRA_FIELDS.includes("customfield_10204"));
+  const p = E.parseJiraExport("Issue key,Assignee,Resolved,Due date,Custom field (Submitted),Custom field (Rejections),Custom field (Reopened),Custom field (Blocked days)\nA-1,X,10/Nov/26 1:00 PM,10/Nov/26 12:00 AM,,0,0,2\n");
+  assert.strictEqual(p.tasks[0].blockedDays, 2);
+});
+t("blocked: timing uses the (already pushed back) due date; flag only at the thresholds", () => {
+  const mem = { id: "b", name: "Bo", salary: 1000000 };
+  const mk = (k, bd) => ({ key: k, assignee: "Bo", type: "Task", resolved: "2026-11-20", due: "2026-11-20", submitted: "2026-11-20", rejections: 0, reopened: 0, labels: [], blockedDays: bd });
+  const run = (tasks, c) => E.computePerson(mem, "2026-11", { tasks, hours: { worked: 999 }, incidents: [] }, c || cfg);
+  const two = run([mk("A-1", 2), mk("A-2", 3), mk("A-3", 0), mk("A-4", 0)]);
+  assert.strictEqual(two.score, 100); assert.strictEqual(two.blockedTasks, 2); assert.strictEqual(two.blockedDays, 5); assert.strictEqual(two.blockedFlagged, false);
+  assert.ok(!two.warnings.some((w) => /Blocked often/.test(w)));
+  const three = run([mk("A-1", 1), mk("A-2", 1), mk("A-3", 1), mk("A-4", 0)]);
+  assert.strictEqual(three.blockedFlagged, true); assert.strictEqual(three.score, 100); // flag never changes pay
+  assert.ok(three.warnings.some((w) => /Blocked often: 3 tasks, 3 working days/.test(w)));
+  const days = run([mk("A-1", 10), mk("A-2", 0), mk("A-3", 0), mk("A-4", 0)]);
+  assert.strictEqual(days.blockedFlagged, true);
+  const off = run([mk("A-1", 10), mk("A-2", 1), mk("A-3", 1), mk("A-4", 0)], Object.assign({}, cfg, { blockedFlag: { tasks: 0, days: 0 } }));
+  assert.strictEqual(off.blockedFlagged, false);
+  const old = run([mk("A-1", 1), mk("A-2", 1), mk("A-3", 1)].map((x) => { delete x.blockedDays; return x; })); // tasks pulled before this field existed
+  assert.strictEqual(old.blockedDays, 0); assert.strictEqual(old.blockedFlagged, false);
+});
+
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);
