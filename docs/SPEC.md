@@ -59,6 +59,7 @@ The same rules apply to every role. Scoring is per person, across all Jira proje
   penalties: { minor: 10, major: 50 },   // % of the bonus per incident; critical = 100%
   issueTypes: ["Task", "Subtask", "Sub-task", "Bug"],   // only these are scored
   excludeLabel: "cancelled",             // tasks with this label are skipped
+  blockedFlag: { tasks: 3, days: 10 },   // "Blocked often" review flag (does not change pay); 0 turns a check off
   shadowMonths: ["2026-12", "2027-01"],  // trial months: current salary is paid, new pay is shown for comparison
   jiraProjects: "GOD, PRJ, AWE",
   holidays: [ /* ISO dates, Armenian public holidays, see section 9 */ ],
@@ -206,6 +207,7 @@ Site: `glana.atlassian.net` (Jira Cloud, team-managed projects GOD, PRJ, AWE).
 | Reopened | `customfield_10199` | number |
 | Submitted | `customfield_10200` | datetime, set when moved to In Review |
 | Started | `customfield_10201` | datetime, when the clock started (not used in scoring) |
+| Blocked days | `customfield_10204` | number, working days the task spent in Blocked (shown and flagged, not scored) |
 
 Dates are used at day precision. Take the calendar date as written in the value (Jira returns Asia/Yerevan local time with a +0400 offset); do not convert to UTC first.
 
@@ -228,13 +230,15 @@ A CSV upload (Jira's "Export CSV, all fields") is also supported as a fallback: 
 
 ### 7.3 How Jira is set up (already done, the calculator depends on it)
 
-Workflow: Backlog → To Do → In Progress → In Review → Done → Archived (after 30 days).
+Workflow: Backlog → To Do → In Progress → (Blocked) → In Review → Done → Archived (after 30 days).
 
 - **Deadlines come from priority.** When a task first enters To Do or In Progress, an automation sets Started = now and Due date = Started + Highest 1 / High 3 / Medium 5 / Low 10 / Lowest 15 working days. Changing priority recalculates from the original start. Moving to Backlog clears the clock.
 - **Only founders** can change priority or due date, and only founders can move a task to Done. Other people's changes are reverted automatically.
 - **Submitted** is set when the task is moved to In Review.
 - **Rejections** +1 each time a task goes from In Review back to work. **Reopened** +1 each time it leaves Done or Archived.
 - Done = accepted. The Resolved date is set at that moment.
+- **Blocked** (status category In Progress) is for work waiting on someone outside the team, e.g. a client. A task can be moved there only from To Do or In Progress, and only after the **Blocked reason** field (`customfield_10202`) is filled in. Entering Blocked stamps **Blocked since** (`customfield_10203`) and notifies the founders. Leaving Blocked (to anything but Backlog) pushes **Due date and Started** forward by the working days spent there, adds them to **Blocked days** (`customfield_10204`), and clears Blocked since and the reason. Sub-tasks of a blocked parent get the same treatment. A task still Blocked after 3 days gets a weekday reminder comment for the founders.
+- Because Jira already moves the deadline, the calculator's timing math does not change. It shows the blocked days next to the due date and flags a person for review ("Blocked often") when, in the pay month, they had at least `blockedFlag.tasks` (3) blocked tasks or `blockedFlag.days` (10) blocked working days. The flag never changes pay.
 
 The calculator only reads Jira. It never writes to it.
 

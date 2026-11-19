@@ -12,6 +12,8 @@ const MONTHN = ["January","February","March","April","May","June","July","August
 const monthName = (m) => { const [y, mo] = m.split("-").map(Number); return MONTHN[mo - 1] + " " + y; };
 const monthShort = (m) => monthName(m).slice(0, 3) + " " + m.slice(0, 4);
 const fmtDate = (d) => { if (!d) return "—"; const [y, m, dd] = d.split("-"); return `${+dd} ${MONTHN[+m - 1].slice(0, 3)}`; };
+// Due date shown already includes the working days the task spent in Blocked (Jira pushes it back).
+const blk = (t) => (t.blockedDays > 0 ? `<div class="small muted" title="Deadline pushed back by ${t.blockedDays} working day${t.blockedDays === 1 ? "" : "s"} spent in Blocked">+${t.blockedDays}d blocked</div>` : "");
 const rid = () => Math.random().toString(36).slice(2, 10) + Date.now().toString(36).slice(-4);
 
 // ---------------- presentation helpers (icons, avatars, colour cues; no pay logic) ----------------
@@ -192,6 +194,7 @@ function cfg() {
   const c = Object.assign(clone(E.DEFAULT_SETTINGS), clone(S.settings || {}));
   c.tax = Object.assign(clone(E.DEFAULT_SETTINGS.tax), (S.settings && S.settings.tax) || {});
   c.payday = Object.assign(clone(E.DEFAULT_SETTINGS.payday), (S.settings && S.settings.payday) || {});
+  c.blockedFlag = Object.assign(clone(E.DEFAULT_SETTINGS.blockedFlag), (S.settings && S.settings.blockedFlag) || {});
   return c;
 }
 function teamFor(month) { const [a, b] = [month + "-01", month + "-31"]; return S.team.filter((m) => m.active !== false && (!m.start || m.start <= b) && (!m.end || m.end >= a)).sort((x, y) => x.name.localeCompare(y.name)); }
@@ -497,7 +500,7 @@ function slipHTML(r, standalone) {
   const c = cfg();
   const basis = r.scoreBasis === "month" ? `Average of ${r.tasksUsed} tasks resolved in ${monthName(r.month)}` : r.scoreBasis === "pool" ? `Quiet month: average of ${r.tasksUsed} tasks from the last ${c.poolMonths} months` : `Not enough tasks yet: default ${c.defaultBonusPct}%`;
   const inc = incidentsFor(r.memberId);
-  const rows = r.tasks.map((t) => `<tr><td><b>${esc(t.key)}</b> ${esc(t.summary)}</td><td>${prio(t.priority)}</td><td class="n">${fmtDate(t.due)}</td><td class="n">${fmtDate(t.submittedOn)}</td><td class="c">${t.late == null ? "—" : t.late}</td><td class="c">${t.rejections || 0}${t.reopened ? ` · reopened` : ""}</td><td class="c">${t.timing == null ? "—" : t.timing}</td><td class="c">${t.quality}</td><td class="c"><b class="sc ${scCls(t.score)}">${+t.score.toFixed(1)}</b></td></tr>`).join("");
+  const rows = r.tasks.map((t) => `<tr><td><b>${esc(t.key)}</b> ${esc(t.summary)}</td><td>${prio(t.priority)}</td><td class="n">${fmtDate(t.due)}${blk(t)}</td><td class="n">${fmtDate(t.submittedOn)}</td><td class="c">${t.late == null ? "—" : t.late}</td><td class="c">${t.rejections || 0}${t.reopened ? ` · reopened` : ""}</td><td class="c">${t.timing == null ? "—" : t.timing}</td><td class="c">${t.quality}</td><td class="c"><b class="sc ${scCls(t.score)}">${+t.score.toFixed(1)}</b></td></tr>`).join("");
   return `
   <div class="slip-head">
     ${avatar(r.name)}<div style="flex:1;min-width:0"><div class="small" style="opacity:.75">Glana · Payslip${r.shadow ? " · shadow month (current salary paid)" : ""}</div><h3>${esc(r.name)} · ${esc(monthName(r.month))}</h3></div>
@@ -597,7 +600,7 @@ function viewTasks() {
   const list = rs.filter((r) => !f || r.memberId === f);
   html += `<div class="card tablewrap section"><div class="panel-h"><h3>Scored tasks · ${esc(monthName(S.month))}</h3><span class="spacer"></span><select data-action="filter" data-live="0" aria-label="Show tasks for"><option value="">Everyone</option>${rs.map((r) => `<option value="${esc(r.memberId)}" ${f === r.memberId ? "selected" : ""}>${esc(r.name)}</option>`).join("")}</select></div><table><thead><tr><th>Task</th><th class="hide-sm">Assignee</th><th>Priority</th><th class="n">Due</th><th class="n">Submitted</th><th class="c">Late</th><th class="c">Rej.</th><th class="c">Timing</th><th class="c">Quality</th><th class="c">Score</th></tr></thead><tbody>`;
   let n = 0;
-  for (const r of list) for (const t of r.tasks) { n++; html += `<tr><td><b>${esc(t.key)}</b> <span class="muted">${esc(t.summary)}</span></td><td class="hide-sm">${esc(r.name)}</td><td>${prio(t.priority)}</td><td class="n">${fmtDate(t.due)}</td><td class="n">${fmtDate(t.submittedOn)}${!t.submitted && t.resolved ? `<span class="muted small" title="No Submitted date; Resolved date used"> *</span>` : ""}</td><td class="c">${t.late == null ? `<span class="muted small">no due</span>` : t.late > 0 ? `<span class="late">${t.late}</span>` : t.late}</td><td class="c">${t.rejections || 0}${t.reopened ? `<div class="small muted">reopened</div>` : ""}</td><td class="c">${t.timing == null ? "—" : t.timing}</td><td class="c">${t.quality}</td><td class="c"><b class="sc ${scCls(t.score)}">${+t.score.toFixed(1)}</b></td></tr>`; }
+  for (const r of list) for (const t of r.tasks) { n++; html += `<tr><td><b>${esc(t.key)}</b> <span class="muted">${esc(t.summary)}</span></td><td class="hide-sm">${esc(r.name)}</td><td>${prio(t.priority)}</td><td class="n">${fmtDate(t.due)}${blk(t)}</td><td class="n">${fmtDate(t.submittedOn)}${!t.submitted && t.resolved ? `<span class="muted small" title="No Submitted date; Resolved date used"> *</span>` : ""}</td><td class="c">${t.late == null ? `<span class="muted small">no due</span>` : t.late > 0 ? `<span class="late">${t.late}</span>` : t.late}</td><td class="c">${t.rejections || 0}${t.reopened ? `<div class="small muted">reopened</div>` : ""}</td><td class="c">${t.timing == null ? "—" : t.timing}</td><td class="c">${t.quality}</td><td class="c"><b class="sc ${scCls(t.score)}">${+t.score.toFixed(1)}</b></td></tr>`; }
   if (!n) html += `<tr><td colspan="10" class="empty">No tasks resolved in ${esc(monthName(S.month))} for the team.</td></tr>`;
   html += `</tbody></table></div><p class="small muted">* no Submitted date, so the Resolved date was used. “no due” = scored on quality only. Tasks labelled “${esc(c.excludeLabel)}” and types other than ${esc(c.issueTypes.join(", "))} are skipped.</p>`;
   return html;
@@ -736,6 +739,8 @@ function viewSettings() {
       <tr><td>Minimum tasks in a month</td><td class="n">${numIn("minTasks", c.minTasks)}</td></tr>
       <tr><td>Quiet month: pool the last N months</td><td class="n">${numIn("poolMonths", c.poolMonths)}</td></tr>
       <tr><td>Default bonus % (not enough data)</td><td class="n">${numIn("defaultBonusPct", c.defaultBonusPct)}</td></tr>
+      <tr><td>Flag "blocked often" from N blocked tasks a month</td><td class="n">${numIn("blockedFlag.tasks", c.blockedFlag.tasks)}</td></tr>
+      <tr><td>…or from N blocked working days a month</td><td class="n">${numIn("blockedFlag.days", c.blockedFlag.days)}</td></tr>
     </tbody></table>
     <label class="f" style="margin-top:12px">Jira projects (keys, comma separated)<input type="text" data-set="jiraProjects" value="${esc(c.jiraProjects)}" data-live="0"></label>
     <label class="f" style="margin-top:8px">Skip tasks with label<input type="text" data-set="excludeLabel" value="${esc(c.excludeLabel)}" data-live="0"></label>
@@ -1168,7 +1173,7 @@ async function loadHistory() {
   try { S.history = { entries: (await apiCall("GET", "api/history?limit=500")).entries }; } catch (e) { S.history = { entries: [], error: e.message }; }
   S.histLoading = false; if (S.tab === "history") render();
 }
-const FIELD = { salary: "salary", name: "name", jiraName: "Jira name", scanName: "face-scan name", role: "role", start: "start date", end: "end date", salaryHistory: "salary history", basePct: "base salary %", hoursPerDay: "hours per day", minTasks: "minimum tasks", poolMonths: "months pooled", defaultBonusPct: "default bonus %", holidays: "public holidays", bands: "score → bonus table", gates: "attendance gates", shadowMonths: "shadow months", issueTypes: "issue types", excludeLabel: "skipped label", jiraProjects: "Jira projects", worked: "hours worked", leave: "leave days", sick: "sick days", unpaid: "unpaid days", pages: "pages", edit: "can edit", admin: "admin", login: "login", password: "password", locked: "locked" };
+const FIELD = { salary: "salary", name: "name", jiraName: "Jira name", scanName: "face-scan name", role: "role", start: "start date", end: "end date", salaryHistory: "salary history", basePct: "base salary %", hoursPerDay: "hours per day", minTasks: "minimum tasks", poolMonths: "months pooled", defaultBonusPct: "default bonus %", holidays: "public holidays", bands: "score → bonus table", gates: "attendance gates", shadowMonths: "shadow months", issueTypes: "issue types", excludeLabel: "skipped label", blockedFlag: "blocked flag", jiraProjects: "Jira projects", worked: "hours worked", leave: "leave days", sick: "sick days", unpaid: "unpaid days", pages: "pages", edit: "can edit", admin: "admin", login: "login", password: "password", locked: "locked" };
 function histVal(v, k) {
   if (v == null || v === "") return "—";
   if (typeof v === "boolean") return v ? "yes" : "no";
@@ -1558,7 +1563,7 @@ async function pullJira() {
   if (S.month !== month) { S.pull = null; return; }
   const tasks = issues.map(E.taskFromJiraApi).filter((t) => t.key);
   tasks.sort((x, y) => (x.resolved || "").localeCompare(y.resolved || "") || x.key.localeCompare(y.key, undefined, { numeric: true }));
-  const parsed = { tasks, rowCount: tasks.length, found: ["key", "summary", "type", "status", "priority", "assignee", "resolved", "due", "submitted", "started", "rejections", "reopened"], missing: [], warnings: truncated.length ? [`More than ${S.pageSize} tasks were resolved on ${truncated.join(", ")}; some may be missing.`] : [] };
+  const parsed = { tasks, rowCount: tasks.length, found: ["key", "summary", "type", "status", "priority", "assignee", "resolved", "due", "submitted", "started", "rejections", "reopened", "blockedDays"], missing: [], warnings: truncated.length ? [`More than ${S.pageSize} tasks were resolved on ${truncated.join(", ")}; some may be missing.`] : [] };
   const ok = await saveJira(parsed, "Pulled from Jira", "jira");
   if (ok) S.animatePull = true;
   S.pull = ok ? { state: "done", count: tasks.length, month } : { state: "error", message: "Pulled the tasks but couldn't save them. Try again.", month };
@@ -1568,11 +1573,11 @@ async function pullJira() {
 // ---------------- sample data ----------------
 function startSample() {
   const db = MemDB();
-  const HDR = ["Summary", "Issue key", "Issue id", "Issue Type", "Status", "Priority", "Assignee", "Created", "Resolved", "Due date", "Labels", "Labels", "Custom field (Rejections)", "Custom field (Reopened)", "Custom field (Started)", "Custom field (Submitted)"];
-  const T = (key, who, summary, pri, due, sub, res, rej, reo, type, labels) => [summary, key, "1", type || "Task", "Done", pri, who, "02/Nov/26 10:00 AM", res, due, (labels || "").split("|")[0] || "", (labels || "").split("|")[1] || "", String(rej || 0), String(reo || 0), "", sub];
+  const HDR = ["Summary", "Issue key", "Issue id", "Issue Type", "Status", "Priority", "Assignee", "Created", "Resolved", "Due date", "Labels", "Labels", "Custom field (Rejections)", "Custom field (Reopened)", "Custom field (Started)", "Custom field (Submitted)", "Custom field (Blocked days)"];
+  const T = (key, who, summary, pri, due, sub, res, rej, reo, type, labels, blocked) => [summary, key, "1", type || "Task", "Done", pri, who, "02/Nov/26 10:00 AM", res, due, (labels || "").split("|")[0] || "", (labels || "").split("|")[1] || "", String(rej || 0), String(reo || 0), "", sub, String(blocked || 0)];
   const A = "Ani Example", D = "Davit Example", L = "Lilit Example";
   const rows = [
-    T("PRJ-101", A, "Competitor research, Georgia", "Medium", "13/Nov/26 12:00 AM", "12/Nov/26 4:10 PM", "13/Nov/26 11:00 AM"),
+    T("PRJ-101", A, "Competitor research, Georgia", "Medium", "13/Nov/26 12:00 AM", "12/Nov/26 4:10 PM", "13/Nov/26 11:00 AM", 0, 0, "Task", "", 2),
     T("PRJ-102", A, "Venue onboarding plan", "High", "10/Nov/26 12:00 AM", "11/Nov/26 6:30 PM", "12/Nov/26 9:00 AM"),
     T("PRJ-103", A, "Weekly sprint report", "Highest", "06/Nov/26 12:00 AM", "06/Nov/26 5:00 PM", "06/Nov/26 6:00 PM"),
     T("PRJ-104", A, "Partner contract summary", "Medium", "18/Nov/26 12:00 AM", "17/Nov/26 1:00 PM", "19/Nov/26 1:00 PM", 1),
