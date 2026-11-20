@@ -14,7 +14,6 @@
 :root {
   /* Layout: app shell with a brand sidebar (icon rail on tablets, bottom bar on phones), a top bar with the pay month, flat full-width panels. */
   --bg: #f5f1fb; --surface: #ffffff; --surface-2: #faf7fe; --surface-3: #efe8fa; --ink: #221433; --muted: #675c79; --line: #e6dcf6; --line-2: #d3c4ee;
-  --side-bg: #1e40af; --side-glow: #3b82f6;
   --brand: #3b1a6b; --brand-ink: #ffffff; --accent: #7c3aed; --accent-ink: #ffffff; --accent-soft: #f1eafd; --accent-text: #6a2bd9;
   --good: #157a3d; --good-soft: #e6f5ec; --warn: #a55a06; --warn-soft: #fdf2e0; --bad: #b42323; --bad-soft: #fde9e9;
   --seg-1: #4c2a85; --seg-2: #7c3aed; --seg-3: #d48a0b;
@@ -31,7 +30,6 @@
 @media (prefers-color-scheme: dark) {
   :root:not([data-theme="light"]) {
     --bg: #130f1a; --surface: #1c1626; --surface-2: #231c30; --surface-3: #2c2340; --ink: #eee8f7; --muted: #a99fba; --line: #352a47; --line-2: #4a3c63;
-    --side-bg: #172554; --side-glow: #2563eb;
     --brand: #2b1452; --brand-ink: #f3edff; --accent: #a78bfa; --accent-ink: #160f22; --accent-soft: #2a2140; --accent-text: #c4b5fd;
     --good: #5bd28b; --good-soft: #15301f; --warn: #f4b54a; --warn-soft: #33260e; --bad: #f58a8a; --bad-soft: #3a1b1d;
     --seg-1: #8f7fb5; --seg-2: #a78bfa; --seg-3: #f4b54a;
@@ -42,7 +40,6 @@
   }
 }
 :root[data-theme="dark"] {
-  --side-bg: #172554; --side-glow: #2563eb;
   --bg: #130f1a; --surface: #1c1626; --surface-2: #231c30; --surface-3: #2c2340; --ink: #eee8f7; --muted: #a99fba; --line: #352a47; --line-2: #4a3c63;
   --brand: #2b1452; --brand-ink: #f3edff; --accent: #a78bfa; --accent-ink: #160f22; --accent-soft: #2a2140; --accent-text: #c4b5fd;
   --good: #5bd28b; --good-soft: #15301f; --warn: #f4b54a; --warn-soft: #33260e; --bad: #f58a8a; --bad-soft: #3a1b1d;
@@ -67,9 +64,9 @@ svg.i { flex: 0 0 auto; display: block; }
 
 /* ---------- sidebar ---------- */
 .side { position: fixed; z-index: 20; top: 0; bottom: 0; left: 0; width: var(--side-w); display: flex; flex-direction: column; padding: 18px 12px 14px; overflow-y: auto; scrollbar-width: none; color: var(--brand-ink); background:
-  radial-gradient(130% 46% at 0% 0%, color-mix(in srgb, var(--side-glow) 46%, transparent), transparent 70%),
-  radial-gradient(110% 36% at 100% 100%, color-mix(in srgb, var(--side-glow) 24%, transparent), transparent 72%),
-  var(--side-bg); }
+  radial-gradient(130% 46% at 0% 0%, color-mix(in srgb, var(--accent) 46%, transparent), transparent 70%),
+  radial-gradient(110% 36% at 100% 100%, color-mix(in srgb, var(--accent) 24%, transparent), transparent 72%),
+  var(--brand); }
 .side::-webkit-scrollbar { display: none; }
 .brand { display: flex; align-items: center; gap: 11px; min-width: 0; padding: 4px 8px; }
 .brand .mark { flex: 0 0 auto; width: 36px; height: 36px; border-radius: 10px; display: grid; place-items: center; background: #fff; }
